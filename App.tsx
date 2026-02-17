@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { BotState, Candle, MarketData, ActionType, TrainingDataPoint, PendingTrade } from './types';
 import { INITIAL_BALANCE, SYMBOLS, TICK_INTERVAL_MS, RETRAINING_INTERVAL_TICKS } from './constants';
@@ -7,7 +8,7 @@ import Chart from './components/Chart';
 import BotControl from './components/BotControl';
 import TradeLog from './components/TradeLog';
 import TradeConfirmationModal from './components/TradeConfirmationModal';
-import { Zap, Settings, RefreshCw } from 'lucide-react';
+import { Zap, Settings, RefreshCw, Globe } from 'lucide-react';
 
 const App: React.FC = () => {
   // --- State Management ---
@@ -42,57 +43,39 @@ const App: React.FC = () => {
   useEffect(() => {
     const initData = async () => {
       setIsLoading(true);
-      // Fetch top coins
       const topCoins = await fetchTopCoins();
       if (topCoins.length > 0) {
         setAvailableSymbols(topCoins.map(c => c.symbol));
         if (!topCoins.find(c => c.symbol === activeSymbol)) {
-           // If current active symbol not in top coins, switch to top 1
            setActiveSymbol(topCoins[0].symbol);
            setMarketData(topCoins[0]);
         }
       }
-      
-      // Fetch initial candles for active symbol
       const initialCandles = await fetchCandles(activeSymbol);
       setCandles(initialCandles);
       setIsLoading(false);
     };
-
     initData();
   }, []);
 
-  // --- Symbol Change Handler ---
   useEffect(() => {
       const switchSymbol = async () => {
           setIsLoading(true);
           const newCandles = await fetchCandles(activeSymbol);
           setCandles(newCandles);
-          
           const ticker = await fetchLatestTicker(activeSymbol);
           if (ticker) setMarketData(ticker);
-          
           setIsLoading(false);
-          // Reset bot ticks for training cycle
           tickCountRef.current = 0;
       };
-      
-      // Only trigger if not initial load
-      if (!isLoading) {
-          switchSymbol();
-      }
+      if (!isLoading) switchSymbol();
   }, [activeSymbol]);
 
-
-  // --- Bot Logic Loop ---
   const runBotCycle = useCallback(async () => {
-    // 1. Fetch Latest Data
     const ticker = await fetchLatestTicker(activeSymbol);
     if (!ticker) return;
-
     setMarketData(ticker);
 
-    // Update Candles locally for smooth chart
     setCandles(prev => {
         if (prev.length === 0) return prev;
         const last = prev[prev.length - 1];
@@ -105,7 +88,6 @@ const App: React.FC = () => {
         return [...prev.slice(0, -1), updatedLast];
     });
     
-    // Get latest candle for logic
     const currentCandle = candles.length > 0 ? {
         ...candles[candles.length - 1],
         close: ticker.price
@@ -113,14 +95,10 @@ const App: React.FC = () => {
 
     if (!currentCandle) return;
 
-    // 2. Auto-Exit Checks (Stop Loss / Take Profit)
-    // We run this BEFORE generating new signals to clear bad/good positions first
     setBotState(currentState => {
-        // Run logic to check exits for active symbol positions
         return checkAutoExits(currentState, ticker.price, activeSymbol, currentCandle);
     });
 
-    // 3. Calculate Market Status
     let newMarketStatus: 'ACTIVE' | 'LOW_VOLATILITY' | 'OFFLINE' = 'ACTIVE';
     if (candles.length >= 5) {
         const recentCandles = candles.slice(-5);
@@ -130,34 +108,23 @@ const App: React.FC = () => {
         }
     }
 
-    // If there is a pending trade, skip AI logic
     if (pendingTrade) return;
 
-    // 4. AI Agent Logic
     if (botState.isRunning && !isTraining) {
         const { action, confidence } = getAgentAction(currentCandle);
-        
-        // Filter actions
         if (action !== ActionType.HOLD && confidence > confidenceThreshold) {
-             // Generate Trade Preview
              const preview = getTradePreview(botState, action, ticker.price, activeSymbol);
-             if (preview) {
-                 setPendingTrade(preview);
-             }
+             if (preview) setPendingTrade(preview);
         } else {
-             // No trade action: Update portfolio value & market status
              setBotState(currentState => {
                 const newState = { ...currentState, marketStatus: newMarketStatus };
-                
-                // Calculate current portfolio value (active + others)
-                const holdingsValue = Object.entries(newState.holdings).reduce((acc, [sym, amt]) => {
-                    if (sym === activeSymbol) return acc + amt * ticker.price;
+                // Fix: Explicitly type the accumulator as number to resolve arithmetic operation errors on lines 121 and 123
+                const holdingsValue = Object.entries(newState.holdings).reduce<number>((acc, [sym, amt]) => {
+                    if (sym === activeSymbol) return acc + (amt * ticker.price);
                     const entry = newState.averageEntryPrices[sym] || 0;
-                    return acc + amt * entry;
+                    return acc + (amt * entry);
                 }, 0);
                 newState.totalPortfolioValue = newState.balance + holdingsValue;
-                
-                // Log data for training (HOLD)
                 const logEntry: TrainingDataPoint = {
                     timestamp: Date.now(),
                     candle: currentCandle,
@@ -166,45 +133,31 @@ const App: React.FC = () => {
                     marketStatus: newMarketStatus,
                 };
                 newState.trainingDataLog = [logEntry, ...newState.trainingDataLog].slice(0, 500);
-                
                 return newState;
              });
         }
     } else {
-        // Update state even if not running
-        setBotState(currentState => ({
-            ...currentState, 
-            marketStatus: newMarketStatus
-        }));
+        setBotState(currentState => ({ ...currentState, marketStatus: newMarketStatus }));
     }
 
     tickCountRef.current += 1;
-
-    // Periodic Retraining
     if (tickCountRef.current % RETRAINING_INTERVAL_TICKS === 0 && botState.isRunning) {
         handleRetrain();
     }
-
-    // Refresh history
     if (tickCountRef.current % 30 === 0) {
         const freshCandles = await fetchCandles(activeSymbol);
         if (freshCandles.length > 0) setCandles(freshCandles);
     }
-    
   }, [botState, isTraining, activeSymbol, candles, pendingTrade, confidenceThreshold]);
 
-  // --- Effects ---
   useEffect(() => {
     if (intervalRef.current) window.clearInterval(intervalRef.current);
     intervalRef.current = window.setInterval(() => {
         runBotCycle();
     }, TICK_INTERVAL_MS);
-    return () => {
-      if (intervalRef.current) window.clearInterval(intervalRef.current);
-    };
+    return () => { if (intervalRef.current) window.clearInterval(intervalRef.current); };
   }, [runBotCycle]);
 
-  // --- Handlers ---
   const handleToggleBot = () => {
     setBotState(prev => ({ ...prev, isRunning: !prev.isRunning }));
   };
@@ -229,10 +182,27 @@ const App: React.FC = () => {
       }, 100);
   };
 
+  const handleResetSession = () => {
+    if (window.confirm("Are you sure you want to reset your paper trading session? This will clear all history and balance.")) {
+        setBotState({
+            isRunning: false,
+            balance: INITIAL_BALANCE,
+            holdings: {},
+            averageEntryPrices: {},
+            activePositions: [],
+            totalPortfolioValue: INITIAL_BALANCE,
+            activeSymbol: SYMBOLS[0],
+            marketStatus: 'ACTIVE',
+            lastTrainingTime: Date.now(),
+            trades: [],
+            trainingDataLog: []
+        });
+        tickCountRef.current = 0;
+    }
+  };
+
   const handleSymbolChange = (newSymbol: string) => {
-      if (newSymbol !== activeSymbol) {
-        setActiveSymbol(newSymbol);
-      }
+      if (newSymbol !== activeSymbol) setActiveSymbol(newSymbol);
   };
 
   const confirmTrade = (finalTrade: PendingTrade) => {
@@ -243,10 +213,9 @@ const App: React.FC = () => {
               finalTrade.price, 
               finalTrade.symbol,
               finalTrade.amount,
-              finalTrade.stopLoss,    // Pass SL from modal
-              finalTrade.takeProfit   // Pass TP from modal
+              finalTrade.stopLoss,
+              finalTrade.takeProfit
           );
-          
           const lastTrade = newState.trades.length > 0 ? newState.trades[0] : null;
           const pnl = (lastTrade && lastTrade.type === ActionType.SELL && lastTrade.symbol === finalTrade.symbol) 
               ? lastTrade.pnl 
@@ -260,44 +229,42 @@ const App: React.FC = () => {
                 marketStatus: currentState.marketStatus,
                 pnl: pnl
             };
-            
           newState.trainingDataLog = [logEntry, ...newState.trainingDataLog].slice(0, 500);
           return newState;
       });
-
-      setPendingTrade(null);
-  };
-
-  const cancelTrade = () => {
       setPendingTrade(null);
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col">
-      {/* Confirmation Modal */}
       <TradeConfirmationModal 
           isOpen={!!pendingTrade} 
           trade={pendingTrade} 
           currentEntryPrice={pendingTrade ? botState.averageEntryPrices[pendingTrade.symbol] : undefined}
           onConfirm={confirmTrade} 
-          onCancel={cancelTrade} 
+          onCancel={() => setPendingTrade(null)} 
       />
 
       {/* Header */}
       <header className="bg-slate-900 border-b border-slate-800 p-4 sticky top-0 z-10 shadow-md">
         <div className="max-w-7xl mx-auto flex justify-between items-center">
           <div className="flex items-center gap-3">
-             <div className="bg-blue-600 p-2 rounded-lg">
+             <div className="bg-blue-600 p-2 rounded-lg shadow-lg shadow-blue-500/20">
                  <Zap className="text-white" size={20} fill="currentColor" />
              </div>
              <div>
-                 <h1 className="font-bold text-xl tracking-tight text-white">KuCoin AI Trader Pro</h1>
-                 <p className="text-xs text-slate-500 font-mono">v2.5.0 • Live Market Data • ccxt</p>
+                 <div className="flex items-center gap-2">
+                    <h1 className="font-bold text-xl tracking-tight text-white">KuCoin AI Trader</h1>
+                    <span className="bg-emerald-500/10 text-emerald-400 text-[10px] px-2 py-0.5 rounded border border-emerald-500/20 font-bold uppercase flex items-center gap-1">
+                        <Globe size={10} /> Live Paper Mode
+                    </span>
+                 </div>
+                 <p className="text-xs text-slate-500 font-mono">v2.5.0 • Real-time Simulation • ccxt.js</p>
              </div>
           </div>
           
           <div className="flex items-center gap-4">
-              <div className="flex items-center bg-slate-800 rounded p-1 overflow-x-auto max-w-[200px] md:max-w-none no-scrollbar">
+              <div className="hidden md:flex items-center bg-slate-800 rounded p-1 overflow-x-auto no-scrollbar border border-slate-700">
                   {availableSymbols.map(sym => (
                       <button 
                         key={sym}
@@ -312,7 +279,7 @@ const App: React.FC = () => {
                       </button>
                   ))}
               </div>
-              <button className="text-slate-400 hover:text-white transition">
+              <button className="text-slate-400 hover:text-white transition p-2 hover:bg-slate-800 rounded-full">
                   <Settings size={20} />
               </button>
           </div>
@@ -321,53 +288,48 @@ const App: React.FC = () => {
 
       {/* Main Content */}
       <main className="flex-1 max-w-7xl mx-auto w-full p-4 md:p-6">
-        
-        {/* Controls & Metrics */}
         <BotControl 
             state={botState} 
             market={marketData} 
             onToggle={handleToggleBot}
             onRetrain={handleRetrain}
+            onReset={handleResetSession}
             isTraining={isTraining}
             trainingMetrics={trainingMetrics}
             confidenceThreshold={confidenceThreshold}
             setConfidenceThreshold={setConfidenceThreshold}
         />
 
-        {/* Dashboard Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[600px]">
-           {/* Chart Section - Takes up 2 cols */}
-           <div className="lg:col-span-2 h-full flex flex-col gap-4">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-auto lg:h-[650px]">
+           <div className="lg:col-span-2 flex flex-col gap-4">
               {isLoading ? (
-                  <div className="h-full w-full bg-slate-900 rounded-lg flex items-center justify-center border border-slate-800">
-                      <div className="flex flex-col items-center gap-2">
-                          <RefreshCw className="animate-spin text-blue-500" size={32} />
-                          <span className="text-slate-400 text-sm">Fetching KuCoin Data...</span>
+                  <div className="flex-1 min-h-[400px] w-full bg-slate-900 rounded-lg flex items-center justify-center border border-slate-800">
+                      <div className="flex flex-col items-center gap-2 text-center">
+                          <RefreshCw className="animate-spin text-blue-500 mb-2" size={32} />
+                          <span className="text-slate-100 font-bold">Synchronizing Live Market</span>
+                          <span className="text-slate-500 text-sm max-w-[200px]">Connecting to KuCoin Gateway via CORS proxy...</span>
                       </div>
                   </div>
               ) : (
                   <Chart data={candles} trades={botState.trades} />
               )}
               
-              {/* Mini Stats Row under Chart */}
-              <div className="grid grid-cols-3 gap-4">
-                  <div className="bg-slate-900 p-3 rounded border border-slate-800">
-                      <div className="text-slate-500 text-xs">Win Rate (24h)</div>
-                      <div className="text-lg font-bold text-slate-200">68.4%</div>
+              <div className="grid grid-cols-3 gap-4 mb-4 lg:mb-0">
+                  <div className="bg-slate-900 p-4 rounded-lg border border-slate-800 shadow-sm">
+                      <div className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Win Rate</div>
+                      <div className="text-xl font-bold text-slate-100 font-mono">68.4%</div>
                   </div>
-                  <div className="bg-slate-900 p-3 rounded border border-slate-800">
-                      <div className="text-slate-500 text-xs">Profit Factor</div>
-                      <div className="text-lg font-bold text-emerald-400">1.85</div>
+                  <div className="bg-slate-900 p-4 rounded-lg border border-slate-800 shadow-sm">
+                      <div className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Profit Factor</div>
+                      <div className="text-xl font-bold text-emerald-400 font-mono">1.85</div>
                   </div>
-                  <div className="bg-slate-900 p-3 rounded border border-slate-800">
-                      <div className="text-slate-500 text-xs">Max Drawdown</div>
-                      <div className="text-lg font-bold text-red-400">-3.2%</div>
+                  <div className="bg-slate-900 p-4 rounded-lg border border-slate-800 shadow-sm">
+                      <div className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Drawdown</div>
+                      <div className="text-xl font-bold text-red-400 font-mono">-3.2%</div>
                   </div>
               </div>
            </div>
-
-           {/* Sidebar - Trade Log */}
-           <div className="h-full">
+           <div className="h-[400px] lg:h-full">
               <TradeLog trades={botState.trades} />
            </div>
         </div>
