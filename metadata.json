@@ -1,0 +1,5 @@
+{
+  "name": "KuCoin AI Trader Pro",
+  "description": "A high-performance React dashboard simulating an AI-driven cryptocurrency trading bot. Features real-time market simulation, reinforcement learning agent visualization, paper trading engine, and comprehensive technical analysis charts.",
+  "requestFramePermissions": []
+}
