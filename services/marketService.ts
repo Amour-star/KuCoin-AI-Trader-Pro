@@ -1,5 +1,5 @@
 import { Candle, MarketData, ConnectivityStatus } from '../types';
-import ccxt from 'ccxt';
+import * as ccxt from 'ccxt';
 
 // --- CCXT Setup ---
 let exchange: any = null;
@@ -9,6 +9,7 @@ export const getConnectivityStatus = () => currentConnectivity;
 
 const getExchange = () => {
   if (!exchange) {
+    // Use the browser-compatible entry point if using local node_modules
     exchange = new ccxt.kucoin({
       proxy: 'https://corsproxy.io/?', 
       enableRateLimit: true,
