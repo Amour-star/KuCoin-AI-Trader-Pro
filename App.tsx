@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { BotState, Candle, MarketData, ActionType, TrainingDataPoint, PendingTrade } from './types';
 import { INITIAL_BALANCE, SYMBOLS, TICK_INTERVAL_MS, RETRAINING_INTERVAL_TICKS } from './constants';
-import { fetchCandles, fetchLatestTicker, fetchTopCoins, mockMarketData } from './services/marketService';
+import { fetchCandles, fetchLatestTicker, fetchTopCoins, mockMarketData, getConnectivityStatus } from './services/marketService';
 import { getAgentAction, executeTrade, getTradePreview, checkAutoExits } from './services/botEngine';
 import Chart from './components/Chart';
 import BotControl from './components/BotControl';
@@ -11,7 +11,6 @@ import TradeConfirmationModal from './components/TradeConfirmationModal';
 import { Zap, Settings, RefreshCw, Globe } from 'lucide-react';
 
 const App: React.FC = () => {
-  // --- State Management ---
   const [activeSymbol, setActiveSymbol] = useState(SYMBOLS[0]);
   const [availableSymbols, setAvailableSymbols] = useState<string[]>(SYMBOLS);
   const [marketData, setMarketData] = useState<MarketData>(mockMarketData[0]);
@@ -24,6 +23,7 @@ const App: React.FC = () => {
   
   const [botState, setBotState] = useState<BotState>({
     isRunning: false,
+    connectivity: 'CONNECTING',
     balance: INITIAL_BALANCE,
     holdings: {},
     averageEntryPrices: {},
@@ -39,7 +39,6 @@ const App: React.FC = () => {
   const tickCountRef = useRef(0);
   const intervalRef = useRef<number | null>(null);
 
-  // --- Initialization ---
   useEffect(() => {
     const initData = async () => {
       setIsLoading(true);
@@ -96,7 +95,10 @@ const App: React.FC = () => {
     if (!currentCandle) return;
 
     setBotState(currentState => {
-        return checkAutoExits(currentState, ticker.price, activeSymbol, currentCandle);
+        return {
+            ...checkAutoExits(currentState, ticker.price, activeSymbol, currentCandle),
+            connectivity: getConnectivityStatus()
+        };
     });
 
     let newMarketStatus: 'ACTIVE' | 'LOW_VOLATILITY' | 'OFFLINE' = 'ACTIVE';
@@ -118,8 +120,8 @@ const App: React.FC = () => {
         } else {
              setBotState(currentState => {
                 const newState = { ...currentState, marketStatus: newMarketStatus };
-                // Fix: Explicitly type the accumulator as number to resolve arithmetic operation errors on lines 121 and 123
-                const holdingsValue = Object.entries(newState.holdings).reduce<number>((acc, [sym, amt]) => {
+                // Fix: Explicitly typing the accumulator 'acc' and destructured value 'amt' to number to avoid left-hand side arithmetic type errors.
+                const holdingsValue = Object.entries(newState.holdings).reduce((acc: number, [sym, amt]: [string, number]) => {
                     if (sym === activeSymbol) return acc + (amt * ticker.price);
                     const entry = newState.averageEntryPrices[sym] || 0;
                     return acc + (amt * entry);
@@ -183,9 +185,10 @@ const App: React.FC = () => {
   };
 
   const handleResetSession = () => {
-    if (window.confirm("Are you sure you want to reset your paper trading session? This will clear all history and balance.")) {
+    if (window.confirm("Are you sure you want to reset your paper trading session?")) {
         setBotState({
             isRunning: false,
+            connectivity: getConnectivityStatus(),
             balance: INITIAL_BALANCE,
             holdings: {},
             averageEntryPrices: {},
@@ -199,10 +202,6 @@ const App: React.FC = () => {
         });
         tickCountRef.current = 0;
     }
-  };
-
-  const handleSymbolChange = (newSymbol: string) => {
-      if (newSymbol !== activeSymbol) setActiveSymbol(newSymbol);
   };
 
   const confirmTrade = (finalTrade: PendingTrade) => {
@@ -245,7 +244,6 @@ const App: React.FC = () => {
           onCancel={() => setPendingTrade(null)} 
       />
 
-      {/* Header */}
       <header className="bg-slate-900 border-b border-slate-800 p-4 sticky top-0 z-10 shadow-md">
         <div className="max-w-7xl mx-auto flex justify-between items-center">
           <div className="flex items-center gap-3">
@@ -268,7 +266,7 @@ const App: React.FC = () => {
                   {availableSymbols.map(sym => (
                       <button 
                         key={sym}
-                        onClick={() => handleSymbolChange(sym)}
+                        onClick={() => setActiveSymbol(sym)}
                         className={`text-xs px-3 py-1.5 rounded font-medium transition whitespace-nowrap ${
                             activeSymbol === sym 
                             ? 'bg-slate-700 text-white shadow-sm' 
@@ -286,7 +284,6 @@ const App: React.FC = () => {
         </div>
       </header>
 
-      {/* Main Content */}
       <main className="flex-1 max-w-7xl mx-auto w-full p-4 md:p-6">
         <BotControl 
             state={botState} 
@@ -307,7 +304,6 @@ const App: React.FC = () => {
                       <div className="flex flex-col items-center gap-2 text-center">
                           <RefreshCw className="animate-spin text-blue-500 mb-2" size={32} />
                           <span className="text-slate-100 font-bold">Synchronizing Live Market</span>
-                          <span className="text-slate-500 text-sm max-w-[200px]">Connecting to KuCoin Gateway via CORS proxy...</span>
                       </div>
                   </div>
               ) : (

@@ -4,6 +4,8 @@ export enum ActionType {
   HOLD = 'HOLD'
 }
 
+export type ConnectivityStatus = 'REALTIME' | 'SIMULATED' | 'CONNECTING';
+
 export interface Candle {
   time: string; // ISO string or formatted time
   timestamp: number;
@@ -51,6 +53,7 @@ export interface TrainingDataPoint {
 
 export interface BotState {
   isRunning: boolean;
+  connectivity: ConnectivityStatus;
   balance: number; // USDT
   holdings: Record<string, number>; // Symbol -> Amount
   averageEntryPrices: Record<string, number>; // Symbol -> Avg Entry Price (Cost Basis)
