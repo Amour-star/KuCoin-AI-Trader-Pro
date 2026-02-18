@@ -362,7 +362,7 @@ const App: React.FC = () => {
                   <Globe size={10} /> Live Paper Mode
                 </span>
               </div>
-              <p className="text-xs text-slate-500 font-mono">v3.0.0 | Paper Simulation | Quant Engine</p>
+              <p className="text-xs text-slate-500 font-mono">v3.0.1 | Paper Simulation | Quant Engine</p>
             </div>
           </div>
 

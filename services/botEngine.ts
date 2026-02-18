@@ -22,6 +22,9 @@ import { appendTrade } from './storage/tradeStorage';
 const REFINEMENT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const SCHEDULER_CHECK_MS = 60 * 1000;
 const MAX_TRAINING_LOG = 500;
+const INACTIVITY_RELAX_START_MS = 2 * 60 * 60 * 1000;
+const INACTIVITY_RELAX_WINDOW_MS = 12 * 60 * 60 * 1000;
+const MAX_MIN_SCORE_RELAX = 0.08;
 
 let tradeSequence = 0;
 let schedulerId: number | null = null;
@@ -80,6 +83,11 @@ const generateTradeId = (symbol: string, type: ActionType, timestamp: number): s
 
 const average = (values: number[]): number =>
   values.length === 0 ? 0 : values.reduce((acc, value) => acc + value, 0) / values.length;
+
+const getLatestTradeTimestamp = (trades: Trade[]): number | null => {
+  if (trades.length === 0) return null;
+  return trades.reduce((latest, trade) => Math.max(latest, trade.timestamp), 0);
+};
 
 const calculateAtr = (candles: Candle[], period: number = 14): number => {
   if (candles.length < 2) return 0;
@@ -198,10 +206,19 @@ const deriveSignal = (state: BotState, candles: Candle[]): EngineSignal => {
 
   const current = candles[candles.length - 1];
   const previous = candles[candles.length - 2];
+  const latestTradeTimestamp = getLatestTradeTimestamp(state.trades);
+  const inactivityMs = latestTradeTimestamp ? Date.now() - latestTradeTimestamp : Number.POSITIVE_INFINITY;
+  const inactivityRelaxRatio =
+    inactivityMs > INACTIVITY_RELAX_START_MS
+      ? clamp((inactivityMs - INACTIVITY_RELAX_START_MS) / INACTIVITY_RELAX_WINDOW_MS, 0, 1)
+      : 0;
+  const scoreRelaxation = MAX_MIN_SCORE_RELAX * inactivityRelaxRatio;
+  const effectiveMinScore = clamp(strategy.parameters.minScore - scoreRelaxation, 0.56, 0.95);
+
   const atr = calculateAtr(candles, 14);
   const atrPct = atr / Math.max(current.close, 1);
   const regime = detectMarketRegime(current, atrPct, strategy.parameters.minAtrPct, strategy.parameters.maxAtrPct);
-  const { score, breakdown, entryReason } = scoreSetup(candles, current, regime, strategy.parameters.minScore);
+  const { score, breakdown, entryReason } = scoreSetup(candles, current, regime, effectiveMinScore);
   const avgVolume = average(candles.slice(-20).map(candle => candle.volume));
   const volumeRatio = avgVolume > 0 ? current.volume / avgVolume : 1;
   const momentum = previous.close > 0 ? (current.close - previous.close) / previous.close : 0;
@@ -216,20 +233,39 @@ const deriveSignal = (state: BotState, candles: Candle[]): EngineSignal => {
   };
 
   let action = ActionType.HOLD;
-  if (regime === 'TRENDING_UP' && score >= strategy.parameters.minScore) {
+  const rangingEntryBuffer = inactivityMs >= 6 * 60 * 60 * 1000 ? 0.01 : 0.04;
+  const rangingEntryAllowed =
+    regime === 'RANGING' &&
+    score >= effectiveMinScore + rangingEntryBuffer &&
+    breakdown.rsiRecovery >= 0.55 &&
+    breakdown.momentumConfirmation >= 0.5 &&
+    volumeRatio >= 0.9;
+
+  if (regime === 'TRENDING_UP' && score >= effectiveMinScore) {
+    action = ActionType.BUY;
+  } else if (rangingEntryAllowed) {
     action = ActionType.BUY;
   } else if ((regime === 'TRENDING_DOWN' || regime === 'HIGH_VOLATILITY') && (state.holdings[state.activeSymbol] || 0) > 0) {
     action = ActionType.SELL;
   }
 
   const confidenceBase = 0.35 + score * 0.55;
-  const confidencePenalty = regime === 'CHOP' ? 0.2 : regime === 'HIGH_VOLATILITY' ? 0.12 : 0;
-  const confidence = clamp(confidenceBase - confidencePenalty, 0.1, 0.95);
+  const confidencePenalty = regime === 'CHOP' ? 0.2 : regime === 'HIGH_VOLATILITY' ? 0.12 : regime === 'RANGING' ? 0.05 : 0;
+  let confidence = clamp(confidenceBase - confidencePenalty, 0.1, 0.95);
+  if (action === ActionType.BUY) {
+    confidence = clamp(Math.max(confidence, 0.62), 0.1, 0.95);
+  }
 
   const notes: string[] = [];
+  if (scoreRelaxation > 0.0001) {
+    notes.push(`Inactivity adaptation active: min score relaxed by ${scoreRelaxation.toFixed(3)}.`);
+  }
   if (regime === 'CHOP') notes.push('Chop regime detected; skipping low-volatility setups.');
   if (regime === 'HIGH_VOLATILITY') notes.push('High volatility regime; risk tightened.');
-  if (score < strategy.parameters.minScore) notes.push('Setup score below threshold.');
+  if (regime === 'RANGING' && action === ActionType.BUY) {
+    notes.push('Ranging high-confluence entry allowed with extra RSI/momentum confirmation.');
+  }
+  if (score < effectiveMinScore) notes.push('Setup score below adaptive threshold.');
 
   return {
     action,
