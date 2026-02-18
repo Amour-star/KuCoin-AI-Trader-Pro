@@ -92,6 +92,7 @@ const App: React.FC = () => {
   const [streamLagMs, setStreamLagMs] = useState<number>(0);
   const [exposureBySymbol, setExposureBySymbol] = useState<Record<string, number>>({});
   const [latencyHeatmap, setLatencyHeatmap] = useState<Record<string, number>>({});
+  const [strategyCounters, setStrategyCounters] = useState({ totalEvaluations: 0, totalSignals: 0, totalTradesExecuted: 0 });
 
   const [botState, setBotState] = useState<BotState>(() => loadPersistedBotState());
 
@@ -182,7 +183,13 @@ const App: React.FC = () => {
       });
       setLatencyHeatmap(detector.getLatencyHeatmap());
     });
-    return off;
+    const offStats = coreEventBus.on('strategy:stats', payload => {
+      setStrategyCounters(payload);
+    });
+    return () => {
+      off();
+      offStats();
+    };
   }, []);
 
   useEffect(() => {
@@ -445,7 +452,7 @@ const App: React.FC = () => {
         />
 
         <div className="mb-3 text-xs text-slate-400 font-mono">[STREAM LAG ms] <span className="text-slate-200">{streamLagMs}</span></div>
-        <div className="mb-4"><PerformanceDashboard trades={botState.trades} initialEquity={INITIAL_BALANCE} exposureBySymbol={exposureBySymbol} /></div>
+        <div className="mb-4"><PerformanceDashboard trades={botState.trades} initialEquity={INITIAL_BALANCE} exposureBySymbol={exposureBySymbol} strategyCounters={strategyCounters} /></div>
         <div className="mb-4"><InstitutionalDashboard trades={botState.trades} latencyHeatmap={latencyHeatmap} /></div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-auto lg:h-[650px]">

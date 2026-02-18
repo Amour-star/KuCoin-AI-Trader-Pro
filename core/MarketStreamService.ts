@@ -43,7 +43,8 @@ export class MarketStreamService {
           close: k.close,
           volume: k.volume,
         })));
-      } catch {
+      } catch (error) {
+        console.error(`[market-stream] bootstrap failed for ${symbol}`, error);
         this.buffers.set(symbol, []);
       }
       this.connect(symbol);
@@ -117,8 +118,8 @@ export class MarketStreamService {
           volume: k.volume,
         });
       }
-    } catch {
-      // noop
+    } catch (error) {
+      console.error(`[market-stream] fallback refresh failed for ${symbol}`, error);
     }
   }
 

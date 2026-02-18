@@ -3,6 +3,7 @@ export type CoreEventMap = {
   'indicator:update': { symbol: string; timestamp: number };
   'signal:update': { symbol: string; action: 'BUY' | 'SELL' | 'HOLD'; confidence: number; modelVersion: string };
   'order:execute': { symbol: string; side: 'BUY' | 'SELL'; qty: number; expectedPrice: number; executedPrice: number };
+  'strategy:stats': { totalEvaluations: number; totalSignals: number; totalTradesExecuted: number };
 };
 
 type Listener<T> = (payload: T) => void;

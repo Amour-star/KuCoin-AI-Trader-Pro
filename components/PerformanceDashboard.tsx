@@ -6,6 +6,11 @@ interface Props {
   trades: Trade[];
   initialEquity: number;
   exposureBySymbol: Record<string, number>;
+  strategyCounters?: {
+    totalEvaluations: number;
+    totalSignals: number;
+    totalTradesExecuted: number;
+  };
 }
 
 const metric = (label: string, value: string) => (
@@ -15,7 +20,7 @@ const metric = (label: string, value: string) => (
   </div>
 );
 
-const PerformanceDashboard: React.FC<Props> = ({ trades, initialEquity, exposureBySymbol }) => {
+const PerformanceDashboard: React.FC<Props> = ({ trades, initialEquity, exposureBySymbol, strategyCounters }) => {
   const snapshot: TradePerformanceSnapshot = useMemo(() => new PerformanceEngine().snapshot(trades, initialEquity), [trades, initialEquity]);
 
   return (
@@ -25,6 +30,12 @@ const PerformanceDashboard: React.FC<Props> = ({ trades, initialEquity, exposure
         {metric('Rolling Sharpe', snapshot.sharpe.toFixed(3))}
         {metric('Rolling Sortino', snapshot.sortino.toFixed(3))}
         {metric('MAR', snapshot.mar.toFixed(3))}
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+        {metric('Evaluations', (strategyCounters?.totalEvaluations || 0).toString())}
+        {metric('Signals', (strategyCounters?.totalSignals || 0).toString())}
+        {metric('Trades Executed', (strategyCounters?.totalTradesExecuted || 0).toString())}
       </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
         {metric('Drawdown', `${snapshot.drawdownPct.toFixed(2)}%`)}
