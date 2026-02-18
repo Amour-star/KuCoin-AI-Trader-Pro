@@ -12,7 +12,11 @@
     "trade:history": "node --experimental-strip-types --es-module-specifier-resolution=node scripts/showHistory.ts",
     "test:bot": "node --experimental-strip-types --es-module-specifier-resolution=node tests/runBotTests.ts",
     "test:institutional": "node --experimental-strip-types --es-module-specifier-resolution=node tests/runInstitutionalValidation.ts",
-    "report:institutional": "node scripts/institutionalReadinessReport.mjs"
+    "report:institutional": "node scripts/institutionalReadinessReport.mjs",
+    "backend:dev": "tsx backend/src/index.ts",
+    "backend:start": "node --import tsx backend/src/index.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
   },
   "dependencies": {
     "vite": "^7.3.1",
@@ -21,12 +25,18 @@
     "@vitejs/plugin-react": "^5.1.4",
     "lucide-react": "^0.574.0",
     "react": "^19.2.4",
-    "ccxt": "^4.5.38"
+    "ccxt": "^4.5.38",
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "@prisma/client": "^5.22.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
     "@vitejs/plugin-react": "^5.0.0",
     "typescript": "~5.8.2",
-    "vite": "^6.2.0"
+    "vite": "^6.2.0",
+    "prisma": "^5.22.0",
+    "tsx": "^4.19.2"
   }
 }
