@@ -142,11 +142,11 @@ const TradeConfirmationModal: React.FC<TradeConfirmationModalProps> = ({ isOpen,
               </div>
               <div className="flex justify-between text-sm">
                   <span className="text-slate-400">Fee (0.1%)</span>
-                  <span className="font-mono text-red-400">-${currentFee.toFixed(4)} USDT</span>
+                  <span className="font-mono text-red-400">-${currentFee.toFixed(4)} USDC</span>
               </div>
               <div className="flex justify-between text-sm pt-2 border-t border-slate-800 font-bold">
                   <span className="text-slate-300">Total Value</span>
-                  <span className="font-mono text-emerald-400">${currentValue.toFixed(2)} USDT</span>
+                  <span className="font-mono text-emerald-400">${currentValue.toFixed(2)} USDC</span>
               </div>
           </div>
 

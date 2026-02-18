@@ -92,7 +92,8 @@ const isFinitePositive = (value: number): boolean => Number.isFinite(value) && v
 const normalizeSymbol = (symbol: string): string => {
   if (symbol.includes('-')) return symbol.toUpperCase();
   const normalized = symbol.toUpperCase();
-  if (normalized.endsWith('USDT')) return `${normalized.slice(0, -4)}-USDT`;
+  if (normalized.endsWith('USDT')) return `${normalized.slice(0, -4)}-USDC`;
+  if (normalized.endsWith('USDC')) return `${normalized.slice(0, -4)}-USDC`;
   return normalized;
 };
 
@@ -194,7 +195,7 @@ const scoreSetup = (
 
 const deriveSignal = (state: BotState, candles: Candle[]): EngineSignal => {
   const strategy = loadStrategyState();
-  if (candles.length < 30) {
+  if (candles.length < 50) {
     const fallback: IndicatorSnapshot = {
       emaShort: candles[candles.length - 1]?.close || 0,
       emaLong: candles[candles.length - 1]?.close || 0,
@@ -218,7 +219,7 @@ const deriveSignal = (state: BotState, candles: Candle[]): EngineSignal => {
       },
       marketRegime: 'CHOP',
       indicators: fallback,
-      entryReason: 'Insufficient candles for setup scoring.',
+      entryReason: 'Insufficient candles for setup scoring (min 50 required).',
       notes: ['Waiting for enough history before evaluating entries.'],
       atr: 0,
     };
@@ -702,7 +703,16 @@ export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleRes
     modelVersion: strategy.version,
   });
 
-  console.info('[trade-cycle]', JSON.stringify({ symbol, timeframe: runtimeConfig.timeframe, lastPrice: input.currentPrice, signal: signal.action, confidence: Number(signal.confidence.toFixed(4)), decisionId }));
+  console.info('[trade-cycle]', JSON.stringify({
+    symbol,
+    timeframe: runtimeConfig.timeframe,
+    price: Number(input.currentPrice.toFixed(8)),
+    ema: Number(signal.indicators.emaShort.toFixed(8)),
+    rsi: Number(signal.indicators.rsi.toFixed(4)),
+    signal: signal.action,
+    confidence: Number(signal.confidence.toFixed(4)),
+    decisionId,
+  }));
 
   if (nextState.isRunning && confidenceEligible) {
     if (signal.action === ActionType.BUY) {

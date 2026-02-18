@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { BotState, Candle, MarketData, ActionType, PendingTrade, TradeExitReason } from './types';
 import { INITIAL_BALANCE, SYMBOLS, TICK_INTERVAL_MS } from './constants';
-import { fetchCandles, fetchLatestTicker, fetchTopCoins, mockMarketData, getConnectivityStatus } from './services/marketService';
+import { fetchCandles, fetchLatestTicker, fetchTopCoins, getConnectivityStatus } from './services/marketService';
 import {
   confirmPendingTrade,
   runBotEngineCycle,
@@ -17,25 +17,6 @@ import TradeConfirmationModal from './components/TradeConfirmationModal';
 import { Zap, Settings, RefreshCw, Globe } from 'lucide-react';
 
 const BOT_STATE_STORAGE_KEY = 'kucoin-paper-bot-state-v2';
-const MAX_SOURCE_DRIFT_PCT = 0.15;
-
-const reanchorCandlesToPrice = (candles: Candle[], targetPrice: number): Candle[] => {
-  if (candles.length === 0) return candles;
-  const lastClose = candles[candles.length - 1].close;
-  if (!(lastClose > 0 && targetPrice > 0)) return candles;
-
-  const ratio = targetPrice / lastClose;
-  return candles.map(candle => ({
-    ...candle,
-    open: candle.open * ratio,
-    high: candle.high * ratio,
-    low: candle.low * ratio,
-    close: candle.close * ratio,
-    emaShort: candle.emaShort ? candle.emaShort * ratio : candle.emaShort,
-    emaLong: candle.emaLong ? candle.emaLong * ratio : candle.emaLong,
-  }));
-};
-
 const createInitialBotState = (): BotState => {
   const strategy = getStrategySummary();
   return {
@@ -91,7 +72,12 @@ const loadPersistedBotState = (): BotState => {
 const App: React.FC = () => {
   const [activeSymbol, setActiveSymbol] = useState(() => loadPersistedBotState().activeSymbol || SYMBOLS[0]);
   const [availableSymbols, setAvailableSymbols] = useState<string[]>(SYMBOLS);
-  const [marketData, setMarketData] = useState<MarketData>(mockMarketData[0]);
+  const [marketData, setMarketData] = useState<MarketData>({
+    symbol: SYMBOLS[0],
+    price: 0,
+    volume24h: 0,
+    change24h: 0,
+  });
   const [candles, setCandles] = useState<Candle[]>([]);
   const [isTraining, setIsTraining] = useState(false);
   const [trainingMetrics, setTrainingMetrics] = useState<{ epoch: number; loss: number }[]>([]);
@@ -175,19 +161,14 @@ const App: React.FC = () => {
     const existingCandles = candlesRef.current;
     if (existingCandles.length === 0) return;
 
-    const lastClose = existingCandles[existingCandles.length - 1].close;
-    const driftPct = lastClose > 0 ? Math.abs(ticker.price - lastClose) / lastClose : 0;
-    const baseCandles =
-      driftPct > MAX_SOURCE_DRIFT_PCT ? reanchorCandlesToPrice(existingCandles, ticker.price) : existingCandles;
-
-    const lastBase = baseCandles[baseCandles.length - 1];
+    const lastBase = existingCandles[existingCandles.length - 1];
     const normalizedCurrent: Candle = {
       ...lastBase,
       close: ticker.price,
       high: Math.max(lastBase.high, ticker.price),
       low: Math.min(lastBase.low, ticker.price),
     };
-    const candlesForDecision = [...baseCandles.slice(0, -1), normalizedCurrent];
+    const candlesForDecision = [...existingCandles.slice(0, -1), normalizedCurrent];
     candlesRef.current = candlesForDecision;
     setCandles(candlesForDecision);
 
@@ -376,7 +357,7 @@ const App: React.FC = () => {
                     activeSymbol === symbol ? 'bg-slate-700 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  {symbol.replace('-USDT', '')}
+                  {symbol.replace('-USDC', '')}
                 </button>
               ))}
             </div>
