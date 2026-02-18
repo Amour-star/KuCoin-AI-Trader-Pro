@@ -1,531 +1,384 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { BotState, Candle, MarketData, ActionType, PendingTrade, TradeExitReason } from './types';
-import { INITIAL_BALANCE, SYMBOLS, TICK_INTERVAL_MS } from './constants';
-import { fetchCandles, fetchLatestTicker, fetchTopCoins, getConnectivityStatus } from './services/marketService';
+import React, { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  confirmPendingTrade,
-  runBotEngineCycle,
-  syncBotStateWithStrategy,
-  triggerStrategyRefinement,
-} from './services/botEngine';
-import { getStrategySummary } from './services/engine/strategyState';
-import { clearTrades, loadTrades, saveTrades } from './services/storage/tradeStorage';
-import Chart from './components/Chart';
-import BotControl from './components/BotControl';
-import TradeLog from './components/TradeLog';
-import TradeConfirmationModal from './components/TradeConfirmationModal';
-import { Zap, Settings, RefreshCw, Globe } from 'lucide-react';
-import { MultiSymbolEngine } from './core/MultiSymbolEngine';
-import { coreEventBus } from './core/EventBus';
-import PerformanceDashboard from './components/PerformanceDashboard';
-import InstitutionalDashboard from './dashboard/InstitutionalDashboard';
-import { LatencyArbitrageDetector } from './latency/LatencyArbitrageDetector';
-import ManualTradePanel from './components/ManualTradePanel';
-import { getBackendStatus, getBackendTrades } from './services/backendApi';
+  DecisionRow,
+  EngineStatus,
+  ForceTradePayload,
+  SettingsPayload,
+  TradeRow,
+  fetchDecisions,
+  fetchStatus,
+  fetchTrades,
+  forceTrade,
+  updateSettings,
+} from './lib/api';
 
-const BOT_STATE_STORAGE_KEY = 'kucoin-paper-bot-state-v2';
-const createInitialBotState = (): BotState => {
-  const strategy = getStrategySummary();
-  return {
-    isRunning: false,
-    autoPaperTrading: true,
-    connectivity: 'CONNECTING',
-    balance: INITIAL_BALANCE,
-    holdings: {},
-    averageEntryPrices: {},
-    activePositions: [],
-    totalPortfolioValue: INITIAL_BALANCE,
-    activeSymbol: SYMBOLS[0],
-    marketStatus: 'ACTIVE',
-    lastTrainingTime: Date.now(),
-    trades: loadTrades(),
-    trainingDataLog: [],
-    strategyVersion: strategy.version,
-    lastRefinementTime: strategy.lastRefinementTime,
-    refinementStatus: 'IDLE',
-    aiWarnings: strategy.warnings,
-  };
+const PAGE_SIZE = 10;
+
+const currency = (value: number | null, digits = 2) =>
+  typeof value === 'number' ? value.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits }) : '—';
+
+const dateTime = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : '—');
+
+const decisionColor = (decision: DecisionRow['decision']) => {
+  if (decision === 'BUY') return 'text-emerald-400';
+  if (decision === 'SELL') return 'text-red-400';
+  return 'text-slate-400';
 };
 
-const loadPersistedBotState = (): BotState => {
-  const fallback = createInitialBotState();
-  if (typeof window === 'undefined') return fallback;
-
-  try {
-    const raw = window.localStorage.getItem(BOT_STATE_STORAGE_KEY);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<BotState>;
-    const strategy = getStrategySummary();
-
-    return {
-      ...fallback,
-      ...parsed,
-      holdings: parsed.holdings || {},
-      averageEntryPrices: parsed.averageEntryPrices || {},
-      activePositions: parsed.activePositions || [],
-      trades: loadTrades(),
-      trainingDataLog: parsed.trainingDataLog || [],
-      autoPaperTrading: parsed.autoPaperTrading ?? true,
-      strategyVersion: strategy.version,
-      lastRefinementTime: strategy.lastRefinementTime,
-      aiWarnings: strategy.warnings,
-      refinementStatus: parsed.refinementStatus || 'IDLE',
-    };
-  } catch {
-    return fallback;
-  }
+const pnlColor = (value: number | null) => {
+  if (typeof value !== 'number') return 'text-slate-200';
+  if (value > 0) return 'text-emerald-400';
+  if (value < 0) return 'text-red-400';
+  return 'text-slate-200';
 };
 
 const App: React.FC = () => {
-  const [activeSymbol, setActiveSymbol] = useState(() => loadPersistedBotState().activeSymbol || SYMBOLS[0]);
-  const [availableSymbols, setAvailableSymbols] = useState<string[]>(SYMBOLS);
-  const [marketData, setMarketData] = useState<MarketData>({
-    symbol: SYMBOLS[0],
-    price: 0,
-    volume24h: 0,
-    change24h: 0,
+  const [status, setStatus] = useState<EngineStatus | null>(null);
+  const [trades, setTrades] = useState<TradeRow[]>([]);
+  const [decisions, setDecisions] = useState<DecisionRow[]>([]);
+
+  const [statusLoading, setStatusLoading] = useState(true);
+  const [tradesLoading, setTradesLoading] = useState(true);
+  const [decisionsLoading, setDecisionsLoading] = useState(true);
+
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [tradesError, setTradesError] = useState<string | null>(null);
+  const [decisionsError, setDecisionsError] = useState<string | null>(null);
+
+  const [backendDisconnected, setBackendDisconnected] = useState(false);
+
+  const [tradePage, setTradePage] = useState(1);
+  const [decisionPage, setDecisionPage] = useState(1);
+
+  const [forceTradeForm, setForceTradeForm] = useState<ForceTradePayload>({
+    symbol: 'ETHUSDC',
+    side: 'BUY',
+    notionalUsd: 100,
+    tpPct: 1.5,
+    slPct: 1,
   });
-  const [candles, setCandles] = useState<Candle[]>([]);
-  const [isTraining, setIsTraining] = useState(false);
-  const [trainingMetrics, setTrainingMetrics] = useState<{ epoch: number; loss: number }[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [pendingTrade, setPendingTrade] = useState<PendingTrade | null>(null);
-  const [confidenceThreshold, setConfidenceThreshold] = useState(0.6);
-  const [streamLagMs, setStreamLagMs] = useState<number>(0);
-  const [exposureBySymbol, setExposureBySymbol] = useState<Record<string, number>>({});
-  const [latencyHeatmap, setLatencyHeatmap] = useState<Record<string, number>>({});
-  const [strategyCounters, setStrategyCounters] = useState({ totalEvaluations: 0, totalSignals: 0, totalTradesExecuted: 0 });
-  const [backendHeartbeat, setBackendHeartbeat] = useState<string>('N/A');
-  const [backendConnected, setBackendConnected] = useState(false);
+  const [settingsForm, setSettingsForm] = useState<SettingsPayload>({ confidenceThreshold: 0.6, autoPaper: true });
+  const [formStatus, setFormStatus] = useState<string | null>(null);
 
-  const [botState, setBotState] = useState<BotState>(() => loadPersistedBotState());
-
-  const tickCountRef = useRef(0);
-  const intervalRef = useRef<number | null>(null);
-  const candlesRef = useRef<Candle[]>([]);
-  const botStateRef = useRef<BotState>(botState);
-  const latencyDetectorRef = useRef(new LatencyArbitrageDetector());
-
-  useEffect(() => {
-    botStateRef.current = botState;
-  }, [botState]);
-
-  useEffect(() => {
-    candlesRef.current = candles;
-  }, [candles]);
-
-  useEffect(() => {
+  const loadStatus = useCallback(async () => {
     try {
-      window.localStorage.setItem(BOT_STATE_STORAGE_KEY, JSON.stringify(botState));
-    } catch {
-      // ignore localStorage failures
+      setStatusLoading(true);
+      setStatusError(null);
+      const next = await fetchStatus();
+      setStatus(next);
+      setSettingsForm({ confidenceThreshold: next.confidenceThreshold, autoPaper: next.autoPaper });
+      setBackendDisconnected(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed loading status';
+      setStatusError(message);
+      setBackendDisconnected(true);
+    } finally {
+      setStatusLoading(false);
     }
-  }, [botState]);
+  }, []);
 
-  useEffect(() => {
-    saveTrades(botState.trades);
-  }, [botState.trades]);
+  const loadTrades = useCallback(async () => {
+    try {
+      setTradesLoading(true);
+      setTradesError(null);
+      const next = await fetchTrades(100);
+      setTrades(next);
+      setBackendDisconnected(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed loading trades';
+      setTradesError(message);
+      setBackendDisconnected(true);
+    } finally {
+      setTradesLoading(false);
+    }
+  }, []);
 
-  useEffect(() => {
-    const exposures: Record<string, number> = {};
-    for (const pos of botState.activePositions) exposures[pos.symbol] = (exposures[pos.symbol] || 0) + pos.amount * pos.entryPrice;
-    setExposureBySymbol(exposures);
-  }, [botState.activePositions]);
-
-  useEffect(() => {
-    const initData = async () => {
-      setIsLoading(true);
-      let symbolToLoad = activeSymbol;
-      const topCoins = await fetchTopCoins();
-      if (topCoins.length > 0) {
-        setAvailableSymbols(topCoins.map(coin => coin.symbol));
-        if (!topCoins.find(coin => coin.symbol === activeSymbol)) {
-          symbolToLoad = topCoins[0].symbol;
-          setActiveSymbol(symbolToLoad);
-          setMarketData(topCoins[0]);
-        }
-      }
-      const initialCandles = await fetchCandles(symbolToLoad);
-      setCandles(initialCandles);
-      candlesRef.current = initialCandles;
-      setIsLoading(false);
-    };
-    void initData();
+  const loadDecisions = useCallback(async () => {
+    try {
+      setDecisionsLoading(true);
+      setDecisionsError(null);
+      const next = await fetchDecisions(100);
+      setDecisions(next);
+      setBackendDisconnected(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed loading decisions';
+      setDecisionsError(message);
+      setBackendDisconnected(true);
+    } finally {
+      setDecisionsLoading(false);
+    }
   }, []);
 
   useEffect(() => {
-    const refreshBackend = async () => {
-      try {
-        const [status, trades] = await Promise.all([getBackendStatus(), getBackendTrades(100)]);
-        setBackendConnected(true);
-        setBackendHeartbeat(status.lastHeartbeatTs ?? 'N/A');
-        setStrategyCounters({
-          totalEvaluations: status.evaluationsCount,
-          totalSignals: status.signalsCount,
-          totalTradesExecuted: status.tradesExecutedCount,
-        });
-        setBotState(prev => ({ ...prev, autoPaperTrading: status.autoPaper, trades }));
-      } catch {
-        setBackendConnected(false);
-        // backend may be offline during frontend-only development.
-      }
-    };
-    void refreshBackend();
-    const id = window.setInterval(() => {
-      void refreshBackend();
-    }, 15000);
-    return () => window.clearInterval(id);
-  }, []);
+    void loadStatus();
+    void loadTrades();
+    void loadDecisions();
+  }, [loadStatus, loadTrades, loadDecisions]);
 
   useEffect(() => {
-    const switchSymbol = async () => {
-      setIsLoading(true);
-      const newCandles = await fetchCandles(activeSymbol);
-      setCandles(newCandles);
-      candlesRef.current = newCandles;
-      const ticker = await fetchLatestTicker(activeSymbol);
-      if (ticker) setMarketData(ticker);
-      setIsLoading(false);
-      tickCountRef.current = 0;
-    };
-    if (!isLoading) {
-      void switchSymbol();
-    }
-  }, [activeSymbol]);
+    const intervalId = window.setInterval(() => {
+      void loadStatus();
+    }, 10000);
 
-  useEffect(() => {
-    setBotState(prev => ({ ...prev, activeSymbol }));
-  }, [activeSymbol]);
+    return () => window.clearInterval(intervalId);
+  }, [loadStatus]);
 
-  useEffect(() => {
-    const off = coreEventBus.on('market:update', payload => {
-      setStreamLagMs(payload.lagMs);
-      const detector = latencyDetectorRef.current;
-      detector.onUpdate({
-        exchange: 'BINANCE',
-        symbol: payload.symbol,
-        bid: payload.close * 0.9999,
-        ask: payload.close * 1.0001,
-        serverTs: payload.candleCloseTs,
-        localReceiveTs: Date.now(),
-      });
-      setLatencyHeatmap(detector.getLatencyHeatmap());
-    });
-    const offStats = coreEventBus.on('strategy:stats', payload => {
-      setStrategyCounters(payload);
-    });
-    return () => {
-      off();
-      offStats();
-    };
-  }, []);
+  const pagedTrades = useMemo(
+    () => trades.slice((tradePage - 1) * PAGE_SIZE, tradePage * PAGE_SIZE),
+    [trades, tradePage],
+  );
+  const pagedDecisions = useMemo(
+    () => decisions.slice((decisionPage - 1) * PAGE_SIZE, decisionPage * PAGE_SIZE),
+    [decisions, decisionPage],
+  );
 
-  useEffect(() => {
-    if (backendConnected) return;
-    const engine = new MultiSymbolEngine({
-      symbols: availableSymbols.length > 0 ? availableSymbols : [activeSymbol],
-      interval: '1m',
-      maxConcurrentSymbols: 4,
-      maxBuffer: 500,
-    }, () => botStateRef.current, trade => {
-      setBotState(prev => {
-        const nextTrades = [...prev.trades, trade];
-        const holdings = { ...prev.holdings };
-        const avg = { ...prev.averageEntryPrices };
-        let balance = prev.balance;
-        if (trade.type === ActionType.BUY) {
-          balance -= trade.price * trade.amount + trade.fee;
-          holdings[trade.symbol] = (holdings[trade.symbol] || 0) + trade.amount;
-          avg[trade.symbol] = trade.price;
-        } else {
-          balance += trade.price * trade.amount - trade.fee;
-          holdings[trade.symbol] = Math.max(0, (holdings[trade.symbol] || 0) - trade.amount);
-        }
-        return { ...prev, trades: nextTrades, holdings, averageEntryPrices: avg, balance, totalPortfolioValue: balance };
-      });
-    });
-    void engine.start();
-    return () => engine.stop();
-  }, [availableSymbols, activeSymbol, backendConnected]);
+  const tradePages = Math.max(1, Math.ceil(trades.length / PAGE_SIZE));
+  const decisionPages = Math.max(1, Math.ceil(decisions.length / PAGE_SIZE));
 
-  const runBotCycle = useCallback(async () => {
-    const ticker = await fetchLatestTicker(activeSymbol);
-    if (!ticker) return;
-    setMarketData(ticker);
+  const submitForceTrade = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setFormStatus(null);
 
-    const existingCandles = candlesRef.current;
-    if (existingCandles.length === 0) return;
-
-    const lastBase = existingCandles[existingCandles.length - 1];
-    const normalizedCurrent: Candle = {
-      ...lastBase,
-      close: ticker.price,
-      high: Math.max(lastBase.high, ticker.price),
-      low: Math.min(lastBase.low, ticker.price),
-    };
-    const candlesForDecision = [...existingCandles.slice(0, -1), normalizedCurrent];
-    candlesRef.current = candlesForDecision;
-    setCandles(candlesForDecision);
-
-    const cycle = runBotEngineCycle({
-      state: botStateRef.current,
-      symbol: activeSymbol,
-      candles: candlesForDecision,
-      currentPrice: ticker.price,
-      confidenceThreshold,
-    });
-
-    const syncedState = syncBotStateWithStrategy({
-      ...cycle.state,
-      connectivity: getConnectivityStatus(),
-    });
-    botStateRef.current = syncedState;
-    setBotState(syncedState);
-
-    if (!syncedState.autoPaperTrading) {
-      setPendingTrade(cycle.pendingTrade);
-    } else {
-      setPendingTrade(null);
-    }
-
-    tickCountRef.current += 1;
-    if (tickCountRef.current % 30 === 0) {
-      const freshCandles = await fetchCandles(activeSymbol);
-      if (freshCandles.length > 0) {
-        setCandles(freshCandles);
-        candlesRef.current = freshCandles;
-      }
-    }
-  }, [activeSymbol, confidenceThreshold]);
-
-  useEffect(() => {
-    if (backendConnected) return;
-    if (intervalRef.current) window.clearInterval(intervalRef.current);
-    intervalRef.current = window.setInterval(() => {
-      void runBotCycle();
-    }, TICK_INTERVAL_MS);
-    return () => {
-      if (intervalRef.current) window.clearInterval(intervalRef.current);
-    };
-  }, [runBotCycle, backendConnected]);
-
-  const handleToggleBot = () => {
-    setBotState(prev => ({ ...prev, isRunning: !prev.isRunning }));
-  };
-
-  const handleToggleAutoPaperTrading = () => {
-    setBotState(prev => ({ ...prev, autoPaperTrading: !prev.autoPaperTrading }));
-    setPendingTrade(null);
-  };
-
-  const handleRetrain = async () => {
-    if (isTraining) return;
-    setIsTraining(true);
-    setTrainingMetrics([]);
-    setBotState(prev => ({ ...prev, refinementStatus: 'RUNNING' }));
-
-    let epoch = 0;
-    const maxEpochs = 20;
-    const progressInterval = window.setInterval(() => {
-      epoch += 1;
-      const baseLoss = 0.55 * Math.exp(-epoch / 7);
-      const wave = Math.sin(epoch * 0.8) * 0.02;
-      const loss = Math.max(0, baseLoss + wave);
-      setTrainingMetrics(prev => [...prev, { epoch, loss }]);
-      if (epoch >= maxEpochs) {
-        window.clearInterval(progressInterval);
-      }
-    }, 100);
-
-    const status = await triggerStrategyRefinement();
-    window.clearInterval(progressInterval);
-    setIsTraining(false);
-    setBotState(prev =>
-      syncBotStateWithStrategy({
-        ...prev,
-        lastTrainingTime: Date.now(),
-        refinementStatus: status,
-      }),
-    );
-  };
-
-  const handleResetSession = () => {
-    if (window.confirm('Are you sure you want to reset your paper trading session?')) {
-      clearTrades();
-      const strategy = getStrategySummary();
-      const resetState: BotState = {
-        isRunning: false,
-        autoPaperTrading: botState.autoPaperTrading,
-        connectivity: getConnectivityStatus(),
-        balance: INITIAL_BALANCE,
-        holdings: {},
-        averageEntryPrices: {},
-        activePositions: [],
-        totalPortfolioValue: INITIAL_BALANCE,
-        activeSymbol,
-        marketStatus: 'ACTIVE',
-        lastTrainingTime: Date.now(),
-        trades: [],
-        trainingDataLog: [],
-        strategyVersion: strategy.version,
-        lastRefinementTime: strategy.lastRefinementTime,
-        refinementStatus: 'IDLE',
-        aiWarnings: strategy.warnings,
-      };
-      botStateRef.current = resetState;
-      setBotState(resetState);
-      setPendingTrade(null);
-      tickCountRef.current = 0;
+    try {
+      await forceTrade(forceTradeForm);
+      setFormStatus('Force trade submitted successfully.');
+      await loadTrades();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to submit force trade';
+      setFormStatus(message);
     }
   };
 
-  const confirmTrade = (finalTrade: PendingTrade, exitReason: TradeExitReason = 'MANUAL') => {
-    setBotState(prev => syncBotStateWithStrategy(confirmPendingTrade(prev, finalTrade, exitReason)));
-    setPendingTrade(null);
-  };
+  const submitSettings = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setFormStatus(null);
 
-  const backtestMetrics = useMemo(() => {
-    const closedTrades = botState.trades
-      .filter(trade => trade.type === ActionType.SELL && typeof trade.pnl === 'number')
-      .sort((a, b) => a.timestamp - b.timestamp);
-
-    const closedCount = closedTrades.length;
-    const winningTrades = closedTrades.filter(trade => (trade.pnl || 0) > 0).length;
-    const winRate = closedCount > 0 ? (winningTrades / closedCount) * 100 : 0;
-
-    const grossProfit = closedTrades.reduce((acc, trade) => acc + Math.max(trade.pnl || 0, 0), 0);
-    const grossLossAbs = closedTrades.reduce((acc, trade) => acc + Math.abs(Math.min(trade.pnl || 0, 0)), 0);
-    const profitFactor = grossLossAbs > 0 ? grossProfit / grossLossAbs : grossProfit > 0 ? Number.POSITIVE_INFINITY : 0;
-
-    let equity = INITIAL_BALANCE;
-    let peak = INITIAL_BALANCE;
-    let maxDrawdownPct = 0;
-
-    for (const trade of closedTrades) {
-      equity += trade.pnl || 0;
-      if (equity > peak) peak = equity;
-      const drawdownPct = peak > 0 ? ((peak - equity) / peak) * 100 : 0;
-      maxDrawdownPct = Math.max(maxDrawdownPct, drawdownPct);
+    try {
+      const result = await updateSettings(settingsForm);
+      setSettingsForm(result);
+      setFormStatus('Settings updated successfully.');
+      await loadStatus();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to update settings';
+      setFormStatus(message);
     }
-
-    return {
-      closedCount,
-      winRate,
-      profitFactor,
-      maxDrawdownPct,
-    };
-  }, [botState.trades]);
+  };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col">
-      <TradeConfirmationModal
-        isOpen={!botState.autoPaperTrading && !!pendingTrade}
-        trade={pendingTrade}
-        currentEntryPrice={pendingTrade ? botState.averageEntryPrices[pendingTrade.symbol] : undefined}
-        onConfirm={confirmTrade}
-        onCancel={() => setPendingTrade(null)}
-      />
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-6">
+      <div className="max-w-7xl mx-auto space-y-6">
+        <header>
+          <h1 className="text-2xl font-bold">KuCoin AI Trader Dashboard</h1>
+          <p className="text-slate-400 text-sm">Backend-driven dashboard (Railway + Neon)</p>
+        </header>
 
-      <header className="bg-slate-900 border-b border-slate-800 p-4 sticky top-0 z-10 shadow-md">
-        <div className="max-w-7xl mx-auto flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <div className="bg-blue-600 p-2 rounded-lg shadow-lg shadow-blue-500/20">
-              <Zap className="text-white" size={20} fill="currentColor" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="font-bold text-xl tracking-tight text-white">KuCoin AI Trader</h1>
-                <span className="bg-emerald-500/10 text-emerald-400 text-[10px] px-2 py-0.5 rounded border border-emerald-500/20 font-bold uppercase flex items-center gap-1">
-                  <Globe size={10} /> Live Paper Mode
-                </span>
-              </div>
-              <p className="text-xs text-slate-500 font-mono">v3.0.1 | Paper Simulation | Quant Engine</p>
-            </div>
-          </div>
+        {backendDisconnected && (
+          <div className="rounded border border-red-500/30 bg-red-500/10 text-red-300 px-4 py-2">Backend disconnected</div>
+        )}
 
-          <div className="flex items-center gap-4">
-            <div className="hidden md:flex items-center bg-slate-800 rounded p-1 overflow-x-auto no-scrollbar border border-slate-700">
-              {availableSymbols.map(symbol => (
-                <button
-                  key={symbol}
-                  onClick={() => setActiveSymbol(symbol)}
-                  className={`text-xs px-3 py-1.5 rounded font-medium transition whitespace-nowrap ${
-                    activeSymbol === symbol ? 'bg-slate-700 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  {symbol.replace('-USDC', '')}
-                </button>
-              ))}
-            </div>
-            <button className="text-slate-400 hover:text-white transition p-2 hover:bg-slate-800 rounded-full">
-              <Settings size={20} />
+        <section className="bg-slate-900 border border-slate-800 rounded p-4">
+          <div className="flex justify-between items-center mb-3">
+            <h2 className="font-semibold">Engine Status</h2>
+            <button onClick={() => void loadStatus()} className="text-sm px-3 py-1 rounded bg-slate-800 hover:bg-slate-700">
+              Refresh
             </button>
           </div>
-        </div>
-      </header>
 
-      <main className="flex-1 max-w-7xl mx-auto w-full p-4 md:p-6">
-        <BotControl
-          state={botState}
-          market={marketData}
-          onToggle={handleToggleBot}
-          onRetrain={() => {
-            void handleRetrain();
-          }}
-          onReset={handleResetSession}
-          isTraining={isTraining}
-          trainingMetrics={trainingMetrics}
-          confidenceThreshold={confidenceThreshold}
-          setConfidenceThreshold={setConfidenceThreshold}
-          autoPaperTrading={botState.autoPaperTrading}
-          onToggleAutoPaperTrading={handleToggleAutoPaperTrading}
-        />
-
-        <div className="mb-3 text-xs text-slate-400 font-mono">[STREAM LAG ms] <span className="text-slate-200">{streamLagMs}</span></div>
-        <div className="mb-3 text-xs text-slate-400 font-mono">[ENGINE HEARTBEAT] <span className="text-slate-200">{backendHeartbeat}</span></div>
-        <ManualTradePanel symbol={activeSymbol.replace('-', '')} />
-        <div className="mb-4"><PerformanceDashboard trades={botState.trades} initialEquity={INITIAL_BALANCE} exposureBySymbol={exposureBySymbol} strategyCounters={strategyCounters} /></div>
-        <div className="mb-4"><InstitutionalDashboard trades={botState.trades} latencyHeatmap={latencyHeatmap} /></div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-auto lg:h-[650px]">
-          <div className="lg:col-span-2 flex flex-col gap-4">
-            {isLoading ? (
-              <div className="flex-1 min-h-[400px] w-full bg-slate-900 rounded-lg flex items-center justify-center border border-slate-800">
-                <div className="flex flex-col items-center gap-2 text-center">
-                  <RefreshCw className="animate-spin text-blue-500 mb-2" size={32} />
-                  <span className="text-slate-100 font-bold">Synchronizing Live Market</span>
-                </div>
-              </div>
-            ) : (
-              <Chart data={candles} trades={botState.trades} />
-            )}
-
-            <div className="grid grid-cols-3 gap-4 mb-4 lg:mb-0">
-              <div className="bg-slate-900 p-4 rounded-lg border border-slate-800 shadow-sm">
-                <div className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Win Rate</div>
-                <div className={`text-xl font-bold font-mono ${backtestMetrics.winRate >= 50 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {backtestMetrics.winRate.toFixed(1)}%
-                </div>
-              </div>
-              <div className="bg-slate-900 p-4 rounded-lg border border-slate-800 shadow-sm">
-                <div className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Profit Factor</div>
-                <div className={`text-xl font-bold font-mono ${backtestMetrics.profitFactor >= 1 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {Number.isFinite(backtestMetrics.profitFactor) ? backtestMetrics.profitFactor.toFixed(2) : 'INF'}
-                </div>
-              </div>
-              <div className="bg-slate-900 p-4 rounded-lg border border-slate-800 shadow-sm">
-                <div className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Drawdown</div>
-                <div className={`text-xl font-bold font-mono ${backtestMetrics.maxDrawdownPct > 0 ? 'text-red-400' : 'text-slate-100'}`}>
-                  -{backtestMetrics.maxDrawdownPct.toFixed(2)}%
-                </div>
-              </div>
+          {statusLoading && <p className="text-slate-400">Loading status…</p>}
+          {statusError && (
+            <div className="text-red-400">
+              {statusError}{' '}
+              <button onClick={() => void loadStatus()} className="underline">
+                Retry
+              </button>
             </div>
+          )}
+          {!statusLoading && !statusError && status && (
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm">
+              <div>running: <span className="font-semibold">{String(status.running)}</span></div>
+              <div>lastHeartbeat: <span className="font-semibold">{dateTime(status.lastHeartbeat)}</span></div>
+              <div>evaluations: <span className="font-semibold">{status.evaluations}</span></div>
+              <div>signals: <span className="font-semibold">{status.signals}</span></div>
+              <div>tradesExecuted: <span className="font-semibold">{status.tradesExecuted}</span></div>
+              <div>openPositions: <span className="font-semibold">{status.openPositions}</span></div>
+            </div>
+          )}
+        </section>
+
+        <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <form onSubmit={submitForceTrade} className="bg-slate-900 border border-slate-800 rounded p-4 space-y-3">
+            <h2 className="font-semibold">Force Trade</h2>
+            <input
+              className="w-full bg-slate-800 rounded px-3 py-2"
+              value={forceTradeForm.symbol}
+              onChange={(event) => setForceTradeForm((prev) => ({ ...prev, symbol: event.target.value.trim().toUpperCase() }))}
+              placeholder="Symbol (ETHUSDC)"
+            />
+            <select
+              className="w-full bg-slate-800 rounded px-3 py-2"
+              value={forceTradeForm.side}
+              onChange={(event) => setForceTradeForm((prev) => ({ ...prev, side: event.target.value as 'BUY' | 'SELL' }))}
+            >
+              <option value="BUY">BUY</option>
+              <option value="SELL">SELL</option>
+            </select>
+            <input
+              className="w-full bg-slate-800 rounded px-3 py-2"
+              type="number"
+              step="0.01"
+              value={forceTradeForm.notionalUsd}
+              onChange={(event) => setForceTradeForm((prev) => ({ ...prev, notionalUsd: Number(event.target.value) }))}
+              placeholder="Notional USD"
+            />
+            <input
+              className="w-full bg-slate-800 rounded px-3 py-2"
+              type="number"
+              step="0.01"
+              value={forceTradeForm.tpPct}
+              onChange={(event) => setForceTradeForm((prev) => ({ ...prev, tpPct: Number(event.target.value) }))}
+              placeholder="TP %"
+            />
+            <input
+              className="w-full bg-slate-800 rounded px-3 py-2"
+              type="number"
+              step="0.01"
+              value={forceTradeForm.slPct}
+              onChange={(event) => setForceTradeForm((prev) => ({ ...prev, slPct: Number(event.target.value) }))}
+              placeholder="SL %"
+            />
+            <button className="bg-blue-600 hover:bg-blue-500 rounded px-3 py-2" type="submit">Confirm Force Trade</button>
+          </form>
+
+          <form onSubmit={submitSettings} className="bg-slate-900 border border-slate-800 rounded p-4 space-y-3">
+            <h2 className="font-semibold">Settings</h2>
+            <input
+              className="w-full bg-slate-800 rounded px-3 py-2"
+              type="number"
+              step="0.01"
+              min="0"
+              max="1"
+              value={settingsForm.confidenceThreshold ?? 0}
+              onChange={(event) => setSettingsForm((prev) => ({ ...prev, confidenceThreshold: Number(event.target.value) }))}
+              placeholder="confidenceThreshold"
+            />
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={Boolean(settingsForm.autoPaper)}
+                onChange={(event) => setSettingsForm((prev) => ({ ...prev, autoPaper: event.target.checked }))}
+              />
+              autoPaper
+            </label>
+            <button className="bg-emerald-600 hover:bg-emerald-500 rounded px-3 py-2" type="submit">Update Settings</button>
+          </form>
+        </section>
+
+        {formStatus && <div className="rounded border border-slate-700 bg-slate-900 px-4 py-2 text-sm">{formStatus}</div>}
+
+        <section className="bg-slate-900 border border-slate-800 rounded p-4 overflow-x-auto">
+          <div className="flex justify-between items-center mb-3">
+            <h2 className="font-semibold">Trades</h2>
+            <button onClick={() => void loadTrades()} className="text-sm px-3 py-1 rounded bg-slate-800 hover:bg-slate-700">Refresh</button>
           </div>
-          <div className="h-[400px] lg:h-full">
-            <TradeLog trades={botState.trades} />
+          {tradesLoading && <p className="text-slate-400">Loading trades…</p>}
+          {tradesError && (
+            <div className="text-red-400">
+              {tradesError}{' '}
+              <button onClick={() => void loadTrades()} className="underline">Retry</button>
+            </div>
+          )}
+          {!tradesLoading && !tradesError && (
+            <>
+              <table className="min-w-full text-sm">
+                <thead className="text-slate-400 border-b border-slate-700">
+                  <tr>
+                    <th className="text-left py-2 pr-3">Time</th>
+                    <th className="text-left py-2 pr-3">Symbol</th>
+                    <th className="text-left py-2 pr-3">Side</th>
+                    <th className="text-left py-2 pr-3">Entry</th>
+                    <th className="text-left py-2 pr-3">Exit</th>
+                    <th className="text-left py-2 pr-3">Qty</th>
+                    <th className="text-left py-2 pr-3">TP</th>
+                    <th className="text-left py-2 pr-3">SL</th>
+                    <th className="text-left py-2 pr-3">Fee</th>
+                    <th className="text-left py-2 pr-3">PnL</th>
+                    <th className="text-left py-2 pr-3">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pagedTrades.map((trade) => (
+                    <tr key={trade.id} className="border-b border-slate-800">
+                      <td className="py-2 pr-3">{dateTime(trade.opened_at)}</td>
+                      <td className="py-2 pr-3">{trade.symbol}</td>
+                      <td className="py-2 pr-3">{trade.side}</td>
+                      <td className="py-2 pr-3">{currency(trade.entry_price)}</td>
+                      <td className="py-2 pr-3">{currency(trade.exit_price)}</td>
+                      <td className="py-2 pr-3">{trade.qty.toFixed(6)}</td>
+                      <td className="py-2 pr-3">{currency(trade.tp_price)}</td>
+                      <td className="py-2 pr-3">{currency(trade.sl_price)}</td>
+                      <td className="py-2 pr-3">{currency(trade.fee)}</td>
+                      <td className={`py-2 pr-3 ${pnlColor(trade.pnl_abs)}`}>{currency(trade.pnl_abs)}</td>
+                      <td className="py-2 pr-3">
+                        <span className={trade.status === 'OPEN' ? 'text-amber-300 font-semibold' : 'text-cyan-300 font-semibold'}>{trade.status}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="flex items-center justify-end gap-2 mt-3">
+                <button disabled={tradePage <= 1} onClick={() => setTradePage((prev) => Math.max(1, prev - 1))} className="px-2 py-1 rounded bg-slate-800 disabled:opacity-40">Prev</button>
+                <span className="text-xs text-slate-400">{tradePage} / {tradePages}</span>
+                <button disabled={tradePage >= tradePages} onClick={() => setTradePage((prev) => Math.min(tradePages, prev + 1))} className="px-2 py-1 rounded bg-slate-800 disabled:opacity-40">Next</button>
+              </div>
+            </>
+          )}
+        </section>
+
+        <section className="bg-slate-900 border border-slate-800 rounded p-4 overflow-x-auto">
+          <div className="flex justify-between items-center mb-3">
+            <h2 className="font-semibold">Decisions</h2>
+            <button onClick={() => void loadDecisions()} className="text-sm px-3 py-1 rounded bg-slate-800 hover:bg-slate-700">Refresh</button>
           </div>
-        </div>
-      </main>
+          {decisionsLoading && <p className="text-slate-400">Loading decisions…</p>}
+          {decisionsError && (
+            <div className="text-red-400">
+              {decisionsError}{' '}
+              <button onClick={() => void loadDecisions()} className="underline">Retry</button>
+            </div>
+          )}
+          {!decisionsLoading && !decisionsError && (
+            <>
+              <table className="min-w-full text-sm">
+                <thead className="text-slate-400 border-b border-slate-700">
+                  <tr>
+                    <th className="text-left py-2 pr-3">Time</th>
+                    <th className="text-left py-2 pr-3">Symbol</th>
+                    <th className="text-left py-2 pr-3">Decision</th>
+                    <th className="text-left py-2 pr-3">Confidence</th>
+                    <th className="text-left py-2 pr-3">Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pagedDecisions.map((decision, index) => (
+                    <tr key={`${decision.ts}-${index}`} className="border-b border-slate-800">
+                      <td className="py-2 pr-3">{dateTime(decision.ts)}</td>
+                      <td className="py-2 pr-3">{decision.symbol}</td>
+                      <td className={`py-2 pr-3 font-semibold ${decisionColor(decision.decision)}`}>{decision.decision}</td>
+                      <td className="py-2 pr-3">{(decision.confidence * 100).toFixed(1)}%</td>
+                      <td className="py-2 pr-3">{decision.reasons.join(', ') || '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="flex items-center justify-end gap-2 mt-3">
+                <button disabled={decisionPage <= 1} onClick={() => setDecisionPage((prev) => Math.max(1, prev - 1))} className="px-2 py-1 rounded bg-slate-800 disabled:opacity-40">Prev</button>
+                <span className="text-xs text-slate-400">{decisionPage} / {decisionPages}</span>
+                <button disabled={decisionPage >= decisionPages} onClick={() => setDecisionPage((prev) => Math.min(decisionPages, prev + 1))} className="px-2 py-1 rounded bg-slate-800 disabled:opacity-40">Next</button>
+              </div>
+            </>
+          )}
+        </section>
+      </div>
     </div>
   );
 };
