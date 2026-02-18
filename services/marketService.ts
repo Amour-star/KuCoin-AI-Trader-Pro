@@ -12,7 +12,7 @@ export const mockMarketData: MarketData[] = [
   { symbol: 'BTC-USDT', price: 64230.5, volume24h: 1542000000, change24h: 2.4 },
   { symbol: 'ETH-USDT', price: 3450.12, volume24h: 840000000, change24h: -1.2 },
   { symbol: 'SOL-USDT', price: 145.6, volume24h: 320000000, change24h: 5.7 },
-  { symbol: 'KCS-USDT', price: 10.45, volume24h: 4500000, change24h: 0.5 },
+  { symbol: 'BNB-USDT', price: 602.34, volume24h: 710000000, change24h: 1.1 },
   { symbol: 'XRP-USDT', price: 0.62, volume24h: 210000000, change24h: 1.1 },
 ];
 
@@ -22,33 +22,21 @@ for (const m of mockMarketData) {
   lastKnownChanges[m.symbol] = m.change24h;
 }
 
-type KucoinBase = 'dev-proxy' | 'direct' | 'cors-proxy';
+const BINANCE_API = 'https://api.binance.com';
 
-const KUCOIN_ORIGIN = 'https://api.kucoin.com';
-const env = ((import.meta as unknown as { env?: Record<string, string> })?.env) || {};
-const useDevProxy = env.VITE_USE_KUCOIN_DEV_PROXY === 'true';
-const KUCOIN_BASES: KucoinBase[] = useDevProxy
-  ? ['dev-proxy', 'direct', 'cors-proxy']
-  : ['direct', 'cors-proxy'];
-const BASE_COOLDOWN_MS = 45_000;
-const baseCooldownUntil: Partial<Record<KucoinBase, number>> = {};
+const asNumber = (value: unknown, fallback: number = 0): number => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+};
 
-const buildKucoinUrl = (
-  base: KucoinBase,
-  path: string,
-  params?: Record<string, string | number | undefined>
-): string => {
-  const query = new URLSearchParams();
-  if (params) {
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null) query.set(key, String(value));
-    }
-  }
-  const suffix = query.toString() ? `?${query.toString()}` : '';
+const toBinanceSymbol = (symbol: string): string => symbol.replace('-', '').toUpperCase();
+const fromBinanceSymbol = (symbol: string): string => symbol.endsWith('USDT') ? `${symbol.slice(0, -4)}-USDT` : symbol;
 
-  if (base === 'dev-proxy') return `/kucoin-api${path}${suffix}`;
-  if (base === 'direct') return `${KUCOIN_ORIGIN}${path}${suffix}`;
-  return `https://corsproxy.io/?${encodeURIComponent(`${KUCOIN_ORIGIN}${path}${suffix}`)}`;
+const isHotTradableUsdtSpot = (binanceSymbol: string): boolean => {
+  if (!binanceSymbol.endsWith('USDT')) return false;
+  const base = binanceSymbol.slice(0, -4);
+  const blockedSuffixes = ['UP', 'DOWN', 'BULL', 'BEAR', '1000'];
+  return base.length > 1 && !blockedSuffixes.some(sfx => base.endsWith(sfx));
 };
 
 const fetchWithTimeout = async (url: string, timeoutMs: number = 12000): Promise<Response> => {
@@ -65,50 +53,18 @@ const fetchWithTimeout = async (url: string, timeoutMs: number = 12000): Promise
   }
 };
 
-const fetchKucoinData = async <T>(
-  path: string,
-  params?: Record<string, string | number | undefined>
-): Promise<T> => {
-  let lastError: unknown = null;
-  const now = Date.now();
-
-  for (const base of KUCOIN_BASES) {
-    const blockedUntil = baseCooldownUntil[base] || 0;
-    if (blockedUntil > now) continue;
-
-    const url = buildKucoinUrl(base, path, params);
-    try {
-      const res = await fetchWithTimeout(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status} from ${base}`);
-
-      const payload = await res.json();
-      if (payload?.code && payload.code !== '200000') {
-        throw new Error(`KuCoin error ${payload.code} from ${base}`);
-      }
-      if (payload?.data === undefined) {
-        throw new Error(`Invalid KuCoin payload from ${base}`);
-      }
-      baseCooldownUntil[base] = 0;
-      return payload.data as T;
-    } catch (err) {
-      lastError = err;
-      baseCooldownUntil[base] = Date.now() + BASE_COOLDOWN_MS;
+const fetchBinanceJson = async <T>(path: string, params?: Record<string, string | number | undefined>): Promise<T> => {
+  const query = new URLSearchParams();
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null) query.set(key, String(value));
     }
   }
 
-  throw lastError || new Error('Failed to fetch KuCoin data from all sources');
-};
-
-const asNumber = (value: unknown, fallback: number = 0): number => {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
-};
-
-const isHotTradableUsdtSpot = (symbol: string): boolean => {
-  if (!symbol.endsWith('-USDT')) return false;
-  const base = symbol.split('-')[0];
-  const blockedSuffixes = ['3L', '3S', '5L', '5S', 'UP', 'DOWN', 'BULL', 'BEAR'];
-  return !blockedSuffixes.some(sfx => base.endsWith(sfx));
+  const url = `${BINANCE_API}${path}${query.toString() ? `?${query.toString()}` : ''}`;
+  const res = await fetchWithTimeout(url);
+  if (!res.ok) throw new Error(`Binance HTTP ${res.status}`);
+  return (await res.json()) as T;
 };
 
 const calculateIndicators = (candles: Candle[]): Candle[] => {
@@ -140,6 +96,7 @@ const calculateIndicators = (candles: Candle[]): Candle[] => {
       else losses -= diff;
     }
   }
+
   if (result.length > rsiPeriod) {
     let avgGain = gains / rsiPeriod;
     let avgLoss = losses / rsiPeriod;
@@ -153,6 +110,7 @@ const calculateIndicators = (candles: Candle[]): Candle[] => {
       result[i].rsi = 100 - 100 / (1 + rs);
     }
   }
+
   return result;
 };
 
@@ -160,29 +118,23 @@ const generateFallbackCandles = (symbol: string, count: number = 100): Candle[] 
   const known = lastKnownPrices[symbol] || mockMarketData.find(m => m.symbol === symbol)?.price || 1000;
   const now = Date.now();
   const candles: Candle[] = [];
-  const changes: number[] = [];
-
-  for (let i = 0; i < count; i++) {
-    changes.push((Math.random() - 0.5) * 0.01);
-  }
 
   let tempPrice = known;
   const history: number[] = [tempPrice];
   for (let i = 0; i < count - 1; i++) {
-    tempPrice = tempPrice / (1 + changes[i]);
+    tempPrice = tempPrice / (1 + (Math.random() - 0.5) * 0.01);
     history.unshift(tempPrice);
   }
 
   for (let i = 0; i < count; i++) {
     const time = now - (count - 1 - i) * 60 * 60 * 1000;
     const close = history[i];
-    const open = i > 0 ? history[i - 1] : close * (1 + (Math.random() - 0.5) * 0.01);
-    const high = Math.max(open, close) * (1 + Math.random() * 0.005);
-    const low = Math.min(open, close) * (1 - Math.random() * 0.005);
-
+    const open = i > 0 ? history[i - 1] : close;
+    const high = Math.max(open, close) * (1 + Math.random() * 0.004);
+    const low = Math.min(open, close) * (1 - Math.random() * 0.004);
     candles.push({
-      time: new Date(time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       timestamp: time,
+      time: new Date(time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       open,
       high,
       low,
@@ -196,31 +148,28 @@ const generateFallbackCandles = (symbol: string, count: number = 100): Candle[] 
 
 export const fetchTopCoins = async (): Promise<MarketData[]> => {
   try {
-    interface KucoinTicker {
+    interface BinanceTicker24h {
       symbol: string;
-      last: string;
-      volValue: string;
-      changeRate: string;
+      lastPrice: string;
+      quoteVolume: string;
+      priceChangePercent: string;
     }
-    type AllTickersData = { ticker: KucoinTicker[] };
-    const data = await fetchKucoinData<AllTickersData>('/api/v1/market/allTickers');
-    const tickers = Array.isArray(data?.ticker) ? data.ticker : [];
 
+    const tickers = await fetchBinanceJson<BinanceTicker24h[]>('/api/v3/ticker/24hr');
     const sorted = tickers
-      .filter((ticker: KucoinTicker) => isHotTradableUsdtSpot(ticker.symbol))
-      .map((ticker: KucoinTicker) => {
-        const symbol = String(ticker.symbol);
-        const price = asNumber(ticker.last);
-        const volume24h = asNumber(ticker.volValue);
-        const change24h = asNumber(ticker.changeRate) * 100;
-
+      .filter(ticker => isHotTradableUsdtSpot(ticker.symbol))
+      .map(ticker => {
+        const symbol = fromBinanceSymbol(ticker.symbol);
+        const price = asNumber(ticker.lastPrice);
+        const volume24h = asNumber(ticker.quoteVolume);
+        const change24h = asNumber(ticker.priceChangePercent);
         return { symbol, price, volume24h, change24h };
       })
-      .filter((t: MarketData) => t.price > 0 && t.volume24h > 0)
-      .sort((a: MarketData, b: MarketData) => b.volume24h - a.volume24h)
+      .filter(t => t.price > 0 && t.volume24h > 0)
+      .sort((a, b) => b.volume24h - a.volume24h)
       .slice(0, 10);
 
-    if (sorted.length === 0) throw new Error('No KuCoin top coins found');
+    if (sorted.length === 0) throw new Error('No Binance top coins found');
 
     for (const t of sorted) {
       lastKnownPrices[t.symbol] = t.price;
@@ -232,52 +181,43 @@ export const fetchTopCoins = async (): Promise<MarketData[]> => {
     return sorted;
   } catch {
     currentConnectivity = 'SIMULATED';
-    for (const m of mockMarketData) {
-      lastKnownPrices[m.symbol] = m.price;
-      lastKnownVolumes[m.symbol] = m.volume24h;
-      lastKnownChanges[m.symbol] = m.change24h;
-    }
     return mockMarketData;
   }
 };
 
 export const fetchCandles = async (symbol: string): Promise<Candle[]> => {
   try {
-    type CandleRow = [string, string, string, string, string, string, string];
-    const rows = await fetchKucoinData<CandleRow[]>('/api/v1/market/candles', {
-      type: '1hour',
-      symbol,
+    type KlineRow = [number, string, string, string, string, string, number, string, number, string, string, string];
+
+    const rows = await fetchBinanceJson<KlineRow[]>('/api/v3/klines', {
+      symbol: toBinanceSymbol(symbol),
+      interval: '1h',
+      limit: 100,
     });
 
-    if (!Array.isArray(rows) || rows.length === 0) {
-      throw new Error('Empty candle data');
-    }
+    if (!Array.isArray(rows) || rows.length === 0) throw new Error('Empty kline data');
 
-    const parsed = rows
+    const candles: Candle[] = rows
       .map(row => {
-        const ts = asNumber(row[0]) * 1000;
+        const ts = asNumber(row[0]);
         const open = asNumber(row[1]);
-        const close = asNumber(row[2]);
-        const high = asNumber(row[3]);
-        const low = asNumber(row[4]);
+        const high = asNumber(row[2]);
+        const low = asNumber(row[3]);
+        const close = asNumber(row[4]);
         const volume = asNumber(row[5]);
-        return { ts, open, close, high, low, volume };
+        return {
+          timestamp: ts,
+          time: new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          open,
+          high,
+          low,
+          close,
+          volume,
+        };
       })
-      .filter(c => c.ts > 0 && c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0)
-      .sort((a, b) => a.ts - b.ts)
-      .slice(-100);
+      .filter(c => c.timestamp > 0 && c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0);
 
-    if (parsed.length === 0) throw new Error('Invalid candle payload');
-
-    const candles: Candle[] = parsed.map(c => ({
-      timestamp: c.ts,
-      time: new Date(c.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      volume: c.volume,
-    }));
+    if (candles.length === 0) throw new Error('Invalid kline payload');
 
     lastKnownPrices[symbol] = candles[candles.length - 1].close;
     currentConnectivity = 'REALTIME';
@@ -290,16 +230,20 @@ export const fetchCandles = async (symbol: string): Promise<Candle[]> => {
 
 export const fetchLatestTicker = async (symbol: string): Promise<MarketData | null> => {
   try {
-    type StatsData = {
-      last: string;
-      volValue: string;
-      changeRate: string;
-    };
+    interface BinanceTicker24hSingle {
+      symbol: string;
+      lastPrice: string;
+      quoteVolume: string;
+      priceChangePercent: string;
+    }
 
-    const stats = await fetchKucoinData<StatsData>('/api/v1/market/stats', { symbol });
-    const price = asNumber(stats?.last, lastKnownPrices[symbol] || 0);
-    const volume24h = asNumber(stats?.volValue, lastKnownVolumes[symbol] || 0);
-    const change24h = asNumber(stats?.changeRate, (lastKnownChanges[symbol] || 0) / 100) * 100;
+    const ticker = await fetchBinanceJson<BinanceTicker24hSingle>('/api/v3/ticker/24hr', {
+      symbol: toBinanceSymbol(symbol),
+    });
+
+    const price = asNumber(ticker.lastPrice, lastKnownPrices[symbol] || 0);
+    const volume24h = asNumber(ticker.quoteVolume, lastKnownVolumes[symbol] || 0);
+    const change24h = asNumber(ticker.priceChangePercent, lastKnownChanges[symbol] || 0);
 
     if (!(price > 0)) throw new Error('Invalid latest price');
 
@@ -308,23 +252,13 @@ export const fetchLatestTicker = async (symbol: string): Promise<MarketData | nu
     lastKnownChanges[symbol] = change24h;
     currentConnectivity = 'REALTIME';
 
-    return {
-      symbol,
-      price,
-      volume24h,
-      change24h,
-    };
+    return { symbol, price, volume24h, change24h };
   } catch {
     currentConnectivity = 'SIMULATED';
-    const prevPrice = lastKnownPrices[symbol] || mockMarketData.find(m => m.symbol === symbol)?.price || 100;
-    const volatility = 0.002;
-    const change = (Math.random() - 0.5) * volatility * prevPrice;
-    const newPrice = prevPrice + change;
-    lastKnownPrices[symbol] = newPrice;
-
+    const fallback = lastKnownPrices[symbol] || mockMarketData.find(m => m.symbol === symbol)?.price || 100;
     return {
       symbol,
-      price: newPrice,
+      price: fallback,
       volume24h: lastKnownVolumes[symbol] || 1000000,
       change24h: lastKnownChanges[symbol] || 0,
     };

@@ -1,7 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { Position } from '../../types';
-
 export interface DecisionRecord {
   id: string;
   ts: number;
@@ -56,135 +52,105 @@ export interface PnLSummary {
   fills: number;
 }
 
-interface JsonlStore<T> {
-  file: string;
-  key: string;
+interface StorageShape {
+  decisions: DecisionRecord[];
+  orders: OrderRecord[];
+  fills: FillRecord[];
+  positions: PositionSnapshotRecord[];
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const stores = {
-  decisions: { file: path.join(DATA_DIR, 'decisions.jsonl'), key: 'kucoin-history-decisions' },
-  orders: { file: path.join(DATA_DIR, 'orders.jsonl'), key: 'kucoin-history-orders' },
-  fills: { file: path.join(DATA_DIR, 'fills.jsonl'), key: 'kucoin-history-fills' },
-  positions: { file: path.join(DATA_DIR, 'positions.jsonl'), key: 'kucoin-history-positions' },
+const HISTORY_STORAGE_KEY = 'kucoin-trade-history-v1';
+let inMemory: StorageShape = {
+  decisions: [],
+  orders: [],
+  fills: [],
+  positions: [],
 };
 
-const isNode = typeof process !== 'undefined' && !!process.versions?.node;
-const canUseLocalStorage = () => typeof window !== 'undefined' && !!window.localStorage;
+const canUseLocalStorage = (): boolean => typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
 
-const ensureNodeStorage = (): void => {
-  if (!isNode) return;
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const loadStorage = (): StorageShape => {
+  if (!canUseLocalStorage()) return inMemory;
+
+  try {
+    const raw = window.localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return inMemory;
+    const parsed = JSON.parse(raw) as Partial<StorageShape>;
+    inMemory = {
+      decisions: Array.isArray(parsed.decisions) ? parsed.decisions : [],
+      orders: Array.isArray(parsed.orders) ? parsed.orders : [],
+      fills: Array.isArray(parsed.fills) ? parsed.fills : [],
+      positions: Array.isArray(parsed.positions) ? parsed.positions : [],
+    };
+  } catch {
+    // keep in-memory fallback
+  }
+
+  return inMemory;
 };
 
-const appendAtomic = <T extends object>(store: JsonlStore<T>, record: T): void => {
-  const line = `${JSON.stringify(record)}\n`;
-  if (isNode) {
-    ensureNodeStorage();
-    const fd = fs.openSync(store.file, 'a');
-    try {
-      fs.writeSync(fd, line, undefined, 'utf8');
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    return;
-  }
+const persistStorage = (next: StorageShape): void => {
+  inMemory = next;
+  if (!canUseLocalStorage()) return;
 
-  if (canUseLocalStorage()) {
-    const raw = window.localStorage.getItem(store.key);
-    const list = raw ? (JSON.parse(raw) as T[]) : [];
-    list.push(record);
-    window.localStorage.setItem(store.key, JSON.stringify(list));
+  try {
+    window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // ignore quota/storage errors
   }
 };
 
-const readAll = <T extends object>(store: JsonlStore<T>): T[] => {
-  if (isNode) {
-    ensureNodeStorage();
-    if (!fs.existsSync(store.file)) return [];
-    const raw = fs.readFileSync(store.file, 'utf8');
-    return raw
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean)
-      .map(line => {
-        try {
-          return JSON.parse(line) as T;
-        } catch {
-          return null;
-        }
-      })
-      .filter((entry): entry is T => entry !== null);
-  }
-
-  if (canUseLocalStorage()) {
-    const raw = window.localStorage.getItem(store.key);
-    if (!raw) return [];
-    try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? (parsed as T[]) : [];
-    } catch {
-      return [];
-    }
-  }
-
-  return [];
+const appendRecord = <K extends keyof StorageShape>(key: K, record: StorageShape[K][number]): void => {
+  const current = loadStorage();
+  persistStorage({
+    ...current,
+    [key]: [...current[key], record],
+  } as StorageShape);
 };
 
 export class TradeHistoryService {
   recordDecision(decision: DecisionRecord): void {
-    appendAtomic(stores.decisions, decision);
+    appendRecord('decisions', decision);
   }
 
   recordOrder(order: OrderRecord): void {
-    appendAtomic(stores.orders, order);
+    appendRecord('orders', order);
   }
 
   recordFill(fill: FillRecord): void {
-    appendAtomic(stores.fills, fill);
+    appendRecord('fills', fill);
   }
 
   recordPositionSnapshot(snapshot: PositionSnapshotRecord): void {
-    appendAtomic(stores.positions, snapshot);
+    appendRecord('positions', snapshot);
   }
 
   getRecentTrades(limit: number): Array<OrderRecord & { fill?: FillRecord }> {
-    const orders = (readAll(stores.orders) as OrderRecord[]).filter(o => o.status !== 'SKIPPED');
-    const fills = readAll(stores.fills) as FillRecord[];
-    const fillByOrder = new Map(fills.map(fill => [fill.orderId, fill]));
+    const history = loadStorage();
+    const orders = history.orders.filter(order => order.status !== 'SKIPPED');
+    const fillByOrder = new Map(history.fills.map(fill => [fill.orderId, fill]));
+
     return orders
-      .slice(-limit)
+      .slice(-Math.max(0, limit))
       .reverse()
       .map(order => ({ ...order, fill: fillByOrder.get(order.orderId) }));
   }
 
   getPnLSummary(from: number, to: number): PnLSummary {
-    const fills = (readAll(stores.fills) as FillRecord[]).filter(fill => fill.ts >= from && fill.ts <= to && fill.status === 'FILLED');
-    const realizedPnl = 0;
+    const history = loadStorage();
+    const fills = history.fills.filter(fill => fill.ts >= from && fill.ts <= to && fill.status === 'FILLED');
     const fees = fills.reduce((acc, fill) => acc + fill.fees, 0);
-    return { from, to, realizedPnl, fees, fills: fills.length };
+    return { from, to, realizedPnl: 0, fees, fills: fills.length };
   }
 
   hasOrderForIdempotencyKey(key: string): boolean {
-    const orders = readAll(stores.orders) as OrderRecord[];
-    return orders.some(order => order.idempotencyKey === key && order.status !== 'SKIPPED');
+    const history = loadStorage();
+    return history.orders.some(order => order.idempotencyKey === key && order.status !== 'SKIPPED');
   }
 
   loadRecentOrders(limit: number): OrderRecord[] {
-    return (readAll(stores.orders) as OrderRecord[]).slice(-limit);
-  }
-
-  static fromPosition(symbol: string, balance: number, positions: Position[], avgEntryPrice: number, totalPortfolioValue: number): PositionSnapshotRecord {
-    const positionSize = positions.filter(p => p.symbol === symbol).reduce((acc, p) => acc + p.amount, 0);
-    return {
-      ts: Date.now(),
-      symbol,
-      balance,
-      positionSize,
-      avgEntryPrice,
-      totalPortfolioValue,
-    };
+    const history = loadStorage();
+    return history.orders.slice(-Math.max(0, limit));
   }
 }
 
