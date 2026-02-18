@@ -1,264 +1,124 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Trade, ActionType } from '../types';
+import { Trade, ActionType, MarketRegime } from '../types';
 import { Download, Filter, X } from 'lucide-react';
 import { loadTrades, subscribeToTradeStorage } from '../services/storage/tradeStorage';
+import { tradeHistoryCoreService } from '../core/TradeHistoryService';
 
 interface TradeLogProps {
   trades: Trade[];
 }
 
-interface TradeHistoryRow {
-  id: string;
-  time: number;
-  symbol: string;
-  side: 'BUY' | 'SELL';
-  entryPrice: number;
-  exitPrice?: number;
-  size: number;
-  fee: number;
-  pnl?: number;
-  pnlPct?: number;
-  confidence?: number;
-  strategyVersion?: string;
-  aiNote?: string;
-}
-
-const round4 = (value: number): number => Number(value.toFixed(4));
-
 const mergeTrades = (propTrades: Trade[], storedTrades: Trade[]): Trade[] => {
   const map = new Map<string, Trade>();
-  for (const trade of [...propTrades, ...storedTrades]) {
-    map.set(trade.id, trade);
-  }
+  for (const trade of [...propTrades, ...storedTrades]) map.set(trade.id, trade);
   return [...map.values()].sort((a, b) => b.timestamp - a.timestamp);
-};
-
-const buildRows = (sourceTrades: Trade[]): TradeHistoryRow[] => {
-  const sorted = [...sourceTrades].sort((a, b) => a.timestamp - b.timestamp);
-  const lastBuyBySymbol = new Map<string, Trade>();
-  const rows: TradeHistoryRow[] = [];
-
-  for (const trade of sorted) {
-    if (trade.type === ActionType.BUY) {
-      lastBuyBySymbol.set(trade.symbol, trade);
-      rows.push({
-        id: trade.id,
-        time: trade.timestamp,
-        symbol: trade.symbol,
-        side: 'BUY',
-        entryPrice: round4(trade.price),
-        size: round4(trade.amount),
-        fee: round4(trade.fee),
-        confidence: trade.setupScore,
-        strategyVersion: trade.strategyVersion,
-        aiNote: trade.aiNotes?.[0],
-      });
-      continue;
-    }
-
-    const entryTrade = lastBuyBySymbol.get(trade.symbol);
-    const entryPrice = entryTrade?.price ?? trade.price;
-    const pnl = typeof trade.pnl === 'number' ? trade.pnl : undefined;
-    const pnlPct = pnl !== undefined && entryPrice > 0 && trade.amount > 0 ? (pnl / (entryPrice * trade.amount)) * 100 : undefined;
-
-    rows.push({
-      id: trade.id,
-      time: trade.timestamp,
-      symbol: trade.symbol,
-      side: 'SELL',
-      entryPrice: round4(entryPrice),
-      exitPrice: round4(trade.price),
-      size: round4(trade.amount),
-      fee: round4(trade.fee),
-      pnl: pnl !== undefined ? round4(pnl) : undefined,
-      pnlPct: pnlPct !== undefined ? round4(pnlPct) : undefined,
-      confidence: trade.setupScore,
-      strategyVersion: trade.strategyVersion,
-      aiNote: trade.aiNotes?.[0],
-    });
-  }
-
-  return rows.sort((a, b) => b.time - a.time);
 };
 
 const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
   const [isFilterOpen, setIsFilterOpen] = useState(false);
-  const [sideFilter, setSideFilter] = useState<string>('ALL');
   const [symbolFilter, setSymbolFilter] = useState<string>('ALL');
+  const [confidenceMin, setConfidenceMin] = useState<string>('0');
+  const [modelVersion, setModelVersion] = useState<string>('ALL');
+  const [regime, setRegime] = useState<string>('ALL');
   const [startDate, setStartDate] = useState<string>('');
   const [endDate, setEndDate] = useState<string>('');
   const [storedTrades, setStoredTrades] = useState<Trade[]>(() => loadTrades());
 
   useEffect(() => {
     const sync = () => setStoredTrades(loadTrades());
-    sync();
     const unsubscribe = subscribeToTradeStorage(sync);
     return unsubscribe;
   }, []);
 
   const sourceTrades = useMemo(() => mergeTrades(trades, storedTrades), [trades, storedTrades]);
-  const historyRows = useMemo(() => buildRows(sourceTrades), [sourceTrades]);
+  const summary = useMemo(() => tradeHistoryCoreService.summarize(sourceTrades), [sourceTrades]);
 
-  const uniqueSymbols = useMemo(() => {
-    const symbols = new Set(historyRows.map(row => row.symbol));
-    return Array.from(symbols).sort();
-  }, [historyRows]);
+  const symbols = useMemo(() => Array.from(new Set(sourceTrades.map(t => t.symbol))).sort(), [sourceTrades]);
+  const versions = useMemo(() => Array.from(new Set(sourceTrades.map(t => t.modelVersion || t.strategyVersion).filter(Boolean))).sort(), [sourceTrades]);
 
-  const filteredRows = useMemo(() => {
-    return historyRows.filter(row => {
-      if (sideFilter !== 'ALL' && row.side !== sideFilter) return false;
-      if (symbolFilter !== 'ALL' && row.symbol !== symbolFilter) return false;
-      if (startDate) {
-        const startTimestamp = new Date(startDate).setHours(0, 0, 0, 0);
-        if (row.time < startTimestamp) return false;
-      }
-      if (endDate) {
-        const endTimestamp = new Date(endDate).setHours(23, 59, 59, 999);
-        if (row.time > endTimestamp) return false;
-      }
-      return true;
-    });
-  }, [historyRows, sideFilter, symbolFilter, startDate, endDate]);
+  const filtered = useMemo(() => sourceTrades.filter(t => {
+    if (symbolFilter !== 'ALL' && t.symbol !== symbolFilter) return false;
+    if (modelVersion !== 'ALL' && (t.modelVersion || t.strategyVersion) !== modelVersion) return false;
+    if (regime !== 'ALL' && (t.marketRegime || 'UNKNOWN') !== regime) return false;
+    if ((t.confidence ?? t.setupScore ?? 0) < Number(confidenceMin)) return false;
+    if (startDate && t.timestamp < new Date(startDate).setHours(0, 0, 0, 0)) return false;
+    if (endDate && t.timestamp > new Date(endDate).setHours(23, 59, 59, 999)) return false;
+    return true;
+  }), [sourceTrades, symbolFilter, modelVersion, regime, confidenceMin, startDate, endDate]);
 
   const downloadCSV = () => {
-    const headers = ['Time', 'Symbol', 'Side', 'Entry Price', 'Exit Price', 'Size', 'Fee', 'PnL', 'PnL %', 'Confidence Score', 'Strategy Version', 'AI Notes'];
-    const rows = filteredRows.map(row => [
-      new Date(row.time).toISOString(),
-      row.symbol,
-      row.side,
-      row.entryPrice,
-      row.exitPrice ?? '',
-      row.size,
-      row.fee,
-      row.pnl ?? '',
-      row.pnlPct ?? '',
-      typeof row.confidence === 'number' ? row.confidence.toFixed(4) : '',
-      row.strategyVersion ?? '',
-      row.aiNote ?? '',
+    const headers = ['Time', 'Symbol', 'Side', 'Entry', 'Exit', 'Size', 'Fee', 'Slippage', 'R:R', 'Hold Time', 'PnL', 'PnL%', 'Confidence', 'Regime', 'Version'];
+    const rows = filtered.map(t => [
+      new Date(t.timestamp).toISOString(),
+      t.symbol,
+      t.type,
+      t.expectedPrice ?? t.price,
+      t.executedPrice ?? t.price,
+      t.amount,
+      t.fee,
+      t.slippage ?? t.simulation?.slippage ?? '',
+      t.rMultiple ?? '',
+      t.holdTimeMs ?? '',
+      t.pnl ?? '',
+      typeof t.pnl === 'number' && t.price > 0 && t.amount > 0 ? ((t.pnl / (t.price * t.amount)) * 100).toFixed(4) : '',
+      t.confidence ?? t.setupScore ?? '',
+      t.marketRegime ?? '',
+      t.modelVersion ?? t.strategyVersion ?? '',
     ]);
 
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(row => row.join(','))].join('\n');
-    const encodedUri = encodeURI(csvContent);
+    const csv = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', 'trade_history_usdc.csv');
-    document.body.appendChild(link);
+    link.href = encodeURI(csv);
+    link.download = 'institutional_trade_history.csv';
     link.click();
-    document.body.removeChild(link);
   };
-
-  const clearFilters = () => {
-    setSideFilter('ALL');
-    setSymbolFilter('ALL');
-    setStartDate('');
-    setEndDate('');
-  };
-
-  const hasActiveFilters = sideFilter !== 'ALL' || symbolFilter !== 'ALL' || startDate !== '' || endDate !== '';
 
   return (
-    <div className="bg-slate-900 rounded-lg border border-slate-800 flex flex-col h-full">
-      <div className="p-4 border-b border-slate-800 flex justify-between items-center shrink-0">
-        <h3 className="text-slate-300 font-semibold flex items-center gap-2">
-          Trade History <span className="text-slate-500 text-xs font-normal">({filteredRows.length})</span>
-        </h3>
-        <div className="flex gap-2">
-          <button
-            onClick={() => setIsFilterOpen(!isFilterOpen)}
-            className={`text-xs flex items-center gap-1 px-3 py-1.5 rounded transition border ${
-              isFilterOpen || hasActiveFilters
-                ? 'bg-blue-500/10 text-blue-400 border-blue-500/30'
-                : 'bg-slate-800 text-slate-400 border-transparent hover:text-slate-200'
-            }`}
-          >
-            <Filter size={14} /> {isFilterOpen ? 'Hide Filters' : 'Filter'}
-          </button>
-          <button
-            onClick={downloadCSV}
-            className="text-xs flex items-center gap-1 bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded transition"
-          >
-            <Download size={14} /> Export CSV
-          </button>
+    <div className="bg-slate-950 rounded-lg border border-slate-800 flex flex-col h-full">
+      <div className="p-3 border-b border-slate-800">
+        <div className="grid grid-cols-2 md:grid-cols-7 gap-2 text-xs">
+          <div>Total Trades: <span className="text-slate-200">{summary.totalTrades}</span></div>
+          <div>Win Rate: <span className="text-slate-200">{(summary.winRate * 100).toFixed(2)}%</span></div>
+          <div>Profit Factor: <span className="text-slate-200">{summary.profitFactor.toFixed(2)}</span></div>
+          <div>Expectancy: <span className="text-slate-200">{summary.expectancy.toFixed(4)}</span></div>
+          <div>Max DD: <span className="text-red-300">{summary.maxDrawdownPct.toFixed(2)}%</span></div>
+          <div>Sharpe Proxy: <span className="text-slate-200">{summary.sharpeProxy.toFixed(3)}</span></div>
+          <div>MAR: <span className="text-slate-200">{summary.mar.toFixed(3)}</span></div>
         </div>
       </div>
 
+      <div className="p-3 border-b border-slate-800 flex justify-between">
+        <button onClick={() => setIsFilterOpen(v => !v)} className="text-xs flex items-center gap-1 px-2 py-1 bg-slate-800 rounded"><Filter size={13} />Filters</button>
+        <button onClick={downloadCSV} className="text-xs px-2 py-1 bg-slate-800 rounded"><Download size={13} className="inline mr-1" />CSV</button>
+      </div>
+
       {isFilterOpen && (
-        <div className="p-3 bg-slate-950/50 border-b border-slate-800 grid grid-cols-2 md:grid-cols-4 gap-3">
-          <div>
-            <label className="text-[10px] text-slate-500 uppercase font-bold block mb-1">Side</label>
-            <select
-              value={sideFilter}
-              onChange={event => setSideFilter(event.target.value)}
-              className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5"
-            >
-              <option value="ALL">All</option>
-              <option value={ActionType.BUY}>Buy</option>
-              <option value={ActionType.SELL}>Sell</option>
-            </select>
-          </div>
-          <div>
-            <label className="text-[10px] text-slate-500 uppercase font-bold block mb-1">Symbol</label>
-            <select
-              value={symbolFilter}
-              onChange={event => setSymbolFilter(event.target.value)}
-              className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5"
-            >
-              <option value="ALL">All Symbols</option>
-              {uniqueSymbols.map(symbol => (
-                <option key={symbol} value={symbol}>{symbol}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="text-[10px] text-slate-500 uppercase font-bold block mb-1">From</label>
-            <input type="date" value={startDate} onChange={event => setStartDate(event.target.value)} className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5 [color-scheme:dark]" />
-          </div>
-          <div>
-            <label className="text-[10px] text-slate-500 uppercase font-bold block mb-1">To</label>
-            <input type="date" value={endDate} onChange={event => setEndDate(event.target.value)} className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5 [color-scheme:dark]" />
-          </div>
-          {hasActiveFilters && (
-            <button onClick={clearFilters} className="col-span-2 md:col-span-4 text-xs text-red-400 hover:text-red-300 flex items-center justify-center gap-1 mt-1 py-1">
-              <X size={12} /> Clear Active Filters
-            </button>
-          )}
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-2 p-3 border-b border-slate-800 text-xs">
+          <select className="bg-slate-900 p-1 rounded" value={symbolFilter} onChange={e => setSymbolFilter(e.target.value)}><option value="ALL">Symbol</option>{symbols.map(s => <option key={s} value={s}>{s}</option>)}</select>
+          <select className="bg-slate-900 p-1 rounded" value={regime} onChange={e => setRegime(e.target.value)}><option value="ALL">Regime</option>{['TRENDING_UP','TRENDING_DOWN','RANGING','CHOP','HIGH_VOLATILITY'].map(r => <option key={r} value={r}>{r}</option>)}</select>
+          <input className="bg-slate-900 p-1 rounded" type="number" min="0" max="1" step="0.01" value={confidenceMin} onChange={e => setConfidenceMin(e.target.value)} placeholder="Min Confidence" />
+          <select className="bg-slate-900 p-1 rounded" value={modelVersion} onChange={e => setModelVersion(e.target.value)}><option value="ALL">Version</option>{versions.map(v => <option key={v} value={v}>{v}</option>)}</select>
+          <input className="bg-slate-900 p-1 rounded [color-scheme:dark]" type="date" value={startDate} onChange={e => setStartDate(e.target.value)} />
+          <input className="bg-slate-900 p-1 rounded [color-scheme:dark]" type="date" value={endDate} onChange={e => setEndDate(e.target.value)} />
+          <button className="col-span-2 md:col-span-6 text-red-300 flex items-center justify-center gap-1" onClick={() => { setSymbolFilter('ALL'); setRegime('ALL'); setConfidenceMin('0'); setModelVersion('ALL'); setStartDate(''); setEndDate(''); }}><X size={12} />Reset Filters</button>
         </div>
       )}
 
-      <div className="flex-1 overflow-auto p-2 min-h-0">
-        <table className="w-full text-left text-xs text-slate-400">
-          <thead className="text-slate-500 font-medium sticky top-0 bg-slate-900 z-10">
-            <tr>
-              <th className="pb-2 pl-2">Time</th><th className="pb-2">Symbol</th><th className="pb-2">Side</th>
-              <th className="pb-2 text-right">Entry Price</th><th className="pb-2 text-right">Exit Price</th><th className="pb-2 text-right">Size</th>
-              <th className="pb-2 text-right">Fee</th><th className="pb-2 text-right">PnL</th><th className="pb-2 text-right">PnL %</th>
-              <th className="pb-2 text-right">Confidence</th><th className="pb-2 text-right">Strategy</th><th className="pb-2 text-right pr-2">Notes</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-800/50">
-            {filteredRows.map(row => (
-              <tr key={row.id} className="hover:bg-slate-800/40">
-                <td className="py-2 pl-2 font-mono whitespace-nowrap">{new Date(row.time).toLocaleString()}</td>
-                <td className="py-2 font-mono text-slate-200">{row.symbol}</td>
-                <td className={`py-2 font-bold ${row.side === 'BUY' ? 'text-emerald-400' : 'text-red-400'}`}>{row.side}</td>
-                <td className="py-2 text-right font-mono">{row.entryPrice.toFixed(4)}</td>
-                <td className="py-2 text-right font-mono">{typeof row.exitPrice === 'number' ? row.exitPrice.toFixed(4) : '-'}</td>
-                <td className="py-2 text-right font-mono">{row.size.toFixed(4)}</td>
-                <td className="py-2 text-right font-mono text-amber-300">{row.fee.toFixed(4)}</td>
-                <td className={`py-2 text-right font-mono ${typeof row.pnl === 'number' ? (row.pnl >= 0 ? 'text-emerald-400' : 'text-red-400') : 'text-slate-500'}`}>
-                  {typeof row.pnl === 'number' ? row.pnl.toFixed(4) : '-'}
-                </td>
-                <td className={`py-2 text-right font-mono ${typeof row.pnlPct === 'number' ? (row.pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400') : 'text-slate-500'}`}>
-                  {typeof row.pnlPct === 'number' ? `${row.pnlPct.toFixed(4)}%` : '-'}
-                </td>
-                <td className="py-2 text-right font-mono text-blue-300">{typeof row.confidence === 'number' ? row.confidence.toFixed(4) : '-'}</td>
-                <td className="py-2 text-right font-mono">{row.strategyVersion ?? '-'}</td>
-                <td className="py-2 text-right pr-2 max-w-[220px] truncate" title={row.aiNote || ''}>{row.aiNote || '-'}</td>
-              </tr>
-            ))}
-            {filteredRows.length === 0 && (
-              <tr><td colSpan={12} className="text-center py-8 text-slate-600 italic">No persisted trade history entries.</td></tr>
-            )}
+      <div className="overflow-auto max-h-[420px]">
+        <table className="w-full text-xs">
+          <thead className="sticky top-0 bg-slate-950 text-slate-400"><tr>
+            <th>Time</th><th>Symbol</th><th>Side</th><th className="text-right">Entry</th><th className="text-right">Exit</th><th className="text-right">Size</th><th className="text-right">Fee</th><th className="text-right">Slippage</th><th className="text-right">R:R</th><th className="text-right">Hold</th><th className="text-right">PnL</th><th className="text-right">PnL%</th><th className="text-right">Confidence</th><th className="text-right">Regime</th><th className="text-right">Version</th>
+          </tr></thead>
+          <tbody>
+            {filtered.map(t => {
+              const pnlPct = typeof t.pnl === 'number' && t.price > 0 && t.amount > 0 ? (t.pnl / (t.price * t.amount)) * 100 : undefined;
+              return <tr key={t.id} className="border-t border-slate-800/60 hover:bg-slate-900/70">
+                <td>{new Date(t.timestamp).toLocaleString()}</td><td>{t.symbol}</td><td className={t.type === ActionType.BUY ? 'text-emerald-400' : 'text-red-400'}>{t.type}</td>
+                <td className="text-right">{(t.expectedPrice ?? t.price).toFixed(4)}</td><td className="text-right">{(t.executedPrice ?? t.price).toFixed(4)}</td><td className="text-right">{t.amount.toFixed(5)}</td><td className="text-right">{t.fee.toFixed(4)}</td><td className="text-right">{(t.slippage ?? t.simulation?.slippage ?? 0).toFixed(6)}</td><td className="text-right">{(t.rMultiple ?? 0).toFixed(2)}</td><td className="text-right">{t.holdTimeMs ? `${Math.round(t.holdTimeMs / 1000)}s` : '-'}</td>
+                <td className={`text-right ${typeof t.pnl === 'number' && t.pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{typeof t.pnl === 'number' ? t.pnl.toFixed(4) : '-'}</td>
+                <td className="text-right">{typeof pnlPct === 'number' ? `${pnlPct.toFixed(3)}%` : '-'}</td><td className="text-right">{(t.confidence ?? t.setupScore ?? 0).toFixed(3)}</td><td className="text-right">{(t.marketRegime || 'N/A') as MarketRegime | 'N/A'}</td><td className="text-right">{t.modelVersion || t.strategyVersion || '-'}</td>
+              </tr>;
+            })}
           </tbody>
         </table>
       </div>

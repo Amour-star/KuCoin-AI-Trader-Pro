@@ -116,6 +116,12 @@ export interface Trade {
   simulation?: ExecutionSimulation;
   decisionId?: string;
   idempotencyKey?: string;
+  expectedPrice?: number;
+  executedPrice?: number;
+  slippage?: number;
+  confidence?: number;
+  modelVersion?: string;
+  holdTimeMs?: number;
 }
 
 
@@ -230,6 +236,16 @@ export interface PerformanceMetrics {
   profitFactor: number;
   grossProfit: number;
   grossLossAbs: number;
+}
+
+export interface TradePerformanceSnapshot {
+  equity: number;
+  drawdownPct: number;
+  sharpe: number;
+  sortino: number;
+  mar: number;
+  winRate: number;
+  symbolContribution: Record<string, number>;
 }
 
 export interface ConditionBucket {

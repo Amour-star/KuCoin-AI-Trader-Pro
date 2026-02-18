@@ -15,6 +15,9 @@ import BotControl from './components/BotControl';
 import TradeLog from './components/TradeLog';
 import TradeConfirmationModal from './components/TradeConfirmationModal';
 import { Zap, Settings, RefreshCw, Globe } from 'lucide-react';
+import { MultiSymbolEngine } from './core/MultiSymbolEngine';
+import { coreEventBus } from './core/EventBus';
+import PerformanceDashboard from './components/PerformanceDashboard';
 
 const BOT_STATE_STORAGE_KEY = 'kucoin-paper-bot-state-v2';
 const createInitialBotState = (): BotState => {
@@ -84,6 +87,8 @@ const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [pendingTrade, setPendingTrade] = useState<PendingTrade | null>(null);
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.6);
+  const [streamLagMs, setStreamLagMs] = useState<number>(0);
+  const [exposureBySymbol, setExposureBySymbol] = useState<Record<string, number>>({});
 
   const [botState, setBotState] = useState<BotState>(() => loadPersistedBotState());
 
@@ -111,6 +116,12 @@ const App: React.FC = () => {
   useEffect(() => {
     saveTrades(botState.trades);
   }, [botState.trades]);
+
+  useEffect(() => {
+    const exposures: Record<string, number> = {};
+    for (const pos of botState.activePositions) exposures[pos.symbol] = (exposures[pos.symbol] || 0) + pos.amount * pos.entryPrice;
+    setExposureBySymbol(exposures);
+  }, [botState.activePositions]);
 
   useEffect(() => {
     const initData = async () => {
@@ -152,6 +163,38 @@ const App: React.FC = () => {
   useEffect(() => {
     setBotState(prev => ({ ...prev, activeSymbol }));
   }, [activeSymbol]);
+
+  useEffect(() => {
+    const off = coreEventBus.on('market:update', payload => setStreamLagMs(payload.lagMs));
+    return off;
+  }, []);
+
+  useEffect(() => {
+    const engine = new MultiSymbolEngine({
+      symbols: availableSymbols.length > 0 ? availableSymbols : [activeSymbol],
+      interval: '1m',
+      maxConcurrentSymbols: 4,
+      maxBuffer: 500,
+    }, () => botStateRef.current, trade => {
+      setBotState(prev => {
+        const nextTrades = [...prev.trades, trade];
+        const holdings = { ...prev.holdings };
+        const avg = { ...prev.averageEntryPrices };
+        let balance = prev.balance;
+        if (trade.type === ActionType.BUY) {
+          balance -= trade.price * trade.amount + trade.fee;
+          holdings[trade.symbol] = (holdings[trade.symbol] || 0) + trade.amount;
+          avg[trade.symbol] = trade.price;
+        } else {
+          balance += trade.price * trade.amount - trade.fee;
+          holdings[trade.symbol] = Math.max(0, (holdings[trade.symbol] || 0) - trade.amount);
+        }
+        return { ...prev, trades: nextTrades, holdings, averageEntryPrices: avg, balance, totalPortfolioValue: balance };
+      });
+    });
+    void engine.start();
+    return () => engine.stop();
+  }, [availableSymbols, activeSymbol]);
 
   const runBotCycle = useCallback(async () => {
     const ticker = await fetchLatestTicker(activeSymbol);
@@ -384,6 +427,9 @@ const App: React.FC = () => {
           autoPaperTrading={botState.autoPaperTrading}
           onToggleAutoPaperTrading={handleToggleAutoPaperTrading}
         />
+
+        <div className="mb-3 text-xs text-slate-400 font-mono">[STREAM LAG ms] <span className="text-slate-200">{streamLagMs}</span></div>
+        <div className="mb-4"><PerformanceDashboard trades={botState.trades} initialEquity={INITIAL_BALANCE} exposureBySymbol={exposureBySymbol} /></div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-auto lg:h-[650px]">
           <div className="lg:col-span-2 flex flex-col gap-4">
