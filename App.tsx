@@ -18,6 +18,8 @@ import { Zap, Settings, RefreshCw, Globe } from 'lucide-react';
 import { MultiSymbolEngine } from './core/MultiSymbolEngine';
 import { coreEventBus } from './core/EventBus';
 import PerformanceDashboard from './components/PerformanceDashboard';
+import InstitutionalDashboard from './dashboard/InstitutionalDashboard';
+import { LatencyArbitrageDetector } from './latency/LatencyArbitrageDetector';
 
 const BOT_STATE_STORAGE_KEY = 'kucoin-paper-bot-state-v2';
 const createInitialBotState = (): BotState => {
@@ -89,6 +91,7 @@ const App: React.FC = () => {
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.6);
   const [streamLagMs, setStreamLagMs] = useState<number>(0);
   const [exposureBySymbol, setExposureBySymbol] = useState<Record<string, number>>({});
+  const [latencyHeatmap, setLatencyHeatmap] = useState<Record<string, number>>({});
 
   const [botState, setBotState] = useState<BotState>(() => loadPersistedBotState());
 
@@ -96,6 +99,7 @@ const App: React.FC = () => {
   const intervalRef = useRef<number | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const botStateRef = useRef<BotState>(botState);
+  const latencyDetectorRef = useRef(new LatencyArbitrageDetector());
 
   useEffect(() => {
     botStateRef.current = botState;
@@ -165,7 +169,19 @@ const App: React.FC = () => {
   }, [activeSymbol]);
 
   useEffect(() => {
-    const off = coreEventBus.on('market:update', payload => setStreamLagMs(payload.lagMs));
+    const off = coreEventBus.on('market:update', payload => {
+      setStreamLagMs(payload.lagMs);
+      const detector = latencyDetectorRef.current;
+      detector.onUpdate({
+        exchange: 'BINANCE',
+        symbol: payload.symbol,
+        bid: payload.close * 0.9999,
+        ask: payload.close * 1.0001,
+        serverTs: payload.candleCloseTs,
+        localReceiveTs: Date.now(),
+      });
+      setLatencyHeatmap(detector.getLatencyHeatmap());
+    });
     return off;
   }, []);
 
@@ -430,6 +446,7 @@ const App: React.FC = () => {
 
         <div className="mb-3 text-xs text-slate-400 font-mono">[STREAM LAG ms] <span className="text-slate-200">{streamLagMs}</span></div>
         <div className="mb-4"><PerformanceDashboard trades={botState.trades} initialEquity={INITIAL_BALANCE} exposureBySymbol={exposureBySymbol} /></div>
+        <div className="mb-4"><InstitutionalDashboard trades={botState.trades} latencyHeatmap={latencyHeatmap} /></div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-auto lg:h-[650px]">
           <div className="lg:col-span-2 flex flex-col gap-4">
