@@ -18,6 +18,8 @@ import { simulateEntryExecution, simulateExitExecution } from './engine/executio
 import { evaluateRisk } from './engine/riskManager';
 import { getStrategySummary, loadStrategyState } from './engine/strategyState';
 import { appendTrade } from './storage/tradeStorage';
+import { getRuntimeConfig, validateRuntimeConfig } from './engine/runtimeConfig';
+import { tradeHistoryService } from './storage/tradeHistoryService';
 
 const REFINEMENT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const SCHEDULER_CHECK_MS = 60 * 1000;
@@ -75,6 +77,24 @@ export interface BotEngineCycleResult {
 
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
 const round = (value: number, decimals: number = 8): number => Number(value.toFixed(decimals));
+
+const hashInput = (value: string): string => {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+  }
+  return Math.abs(hash >>> 0).toString(16);
+};
+
+const isFinitePositive = (value: number): boolean => Number.isFinite(value) && value > 0;
+
+const normalizeSymbol = (symbol: string): string => {
+  if (symbol.includes('-')) return symbol.toUpperCase();
+  const normalized = symbol.toUpperCase();
+  if (normalized.endsWith('USDT')) return `${normalized.slice(0, -4)}-USDT`;
+  return normalized;
+};
 
 const generateTradeId = (symbol: string, type: ActionType, timestamp: number): string => {
   tradeSequence += 1;
@@ -617,7 +637,42 @@ export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleRes
   ensureRefinementScheduler();
   maybeScheduleRefinement();
 
+  const runtimeConfig = getRuntimeConfig();
+  const runtimeErrors = validateRuntimeConfig(runtimeConfig);
+  if (runtimeErrors.length > 0) {
+    return {
+      state: {
+        ...input.state,
+        aiWarnings: [...runtimeErrors, ...input.state.aiWarnings].slice(0, 20),
+      },
+      pendingTrade: null,
+    };
+  }
+
   const strategy = loadStrategyState();
+  const symbol = normalizeSymbol(input.symbol);
+  const latest = input.candles[input.candles.length - 1];
+  if (!latest || !isFinitePositive(input.currentPrice) || !isFinitePositive(latest.close)) {
+    return {
+      state: {
+        ...input.state,
+        aiWarnings: ['Invalid market data: missing/NaN price candle.', ...input.state.aiWarnings].slice(0, 20),
+      },
+      pendingTrade: null,
+    };
+  }
+
+  const staleAge = Date.now() - latest.timestamp;
+  if (staleAge > runtimeConfig.staleDataMs) {
+    return {
+      state: {
+        ...input.state,
+        aiWarnings: [`Stale market data for ${symbol}: ${staleAge}ms old.`, ...input.state.aiWarnings].slice(0, 20),
+      },
+      pendingTrade: null,
+    };
+  }
+
   const signal = deriveSignal(input.state, input.candles);
   let nextState: BotState = {
     ...input.state,
@@ -627,17 +682,33 @@ export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleRes
     marketStatus: toMarketStatus(signal.marketRegime),
   };
 
-  nextState = processAutoExits(nextState, input.symbol, input.currentPrice, Math.max(signal.atr, 1e-8));
+  nextState = processAutoExits(nextState, symbol, input.currentPrice, Math.max(signal.atr, 1e-8));
 
   let pendingTrade: PendingTrade | null = null;
-  const holdings = nextState.holdings[input.symbol] || 0;
+  const holdings = nextState.holdings[symbol] || 0;
   const confidenceEligible = signal.confidence >= input.confidenceThreshold;
+  const decisionTs = Date.now();
+  const inputsHash = hashInput(`${symbol}:${runtimeConfig.timeframe}:${latest.close}:${latest.volume}`);
+  const decisionId = `${symbol}-${decisionTs}-${signal.action}`;
+  tradeHistoryService.recordDecision({
+    id: decisionId,
+    ts: decisionTs,
+    symbol,
+    timeframe: runtimeConfig.timeframe,
+    inputsHash,
+    signal: signal.action,
+    confidence: signal.confidence,
+    reasons: [signal.entryReason, ...signal.notes],
+    modelVersion: strategy.version,
+  });
+
+  console.info('[trade-cycle]', JSON.stringify({ symbol, timeframe: runtimeConfig.timeframe, lastPrice: input.currentPrice, signal: signal.action, confidence: Number(signal.confidence.toFixed(4)), decisionId }));
 
   if (nextState.isRunning && confidenceEligible) {
     if (signal.action === ActionType.BUY) {
       const risk = evaluateRisk({
         state: nextState,
-        symbol: input.symbol,
+        symbol,
         action: ActionType.BUY,
         price: input.currentPrice,
         atr: Math.max(signal.atr, 1e-8),
@@ -647,8 +718,19 @@ export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleRes
       });
 
       if (risk.allowed) {
+        const expectedEdge = (risk.takeProfit && risk.stopLoss) ? (risk.takeProfit - input.currentPrice) / Math.max(input.currentPrice - risk.stopLoss, 1e-8) : 0;
+        const currentExposure = (nextState.totalPortfolioValue - nextState.balance) / Math.max(nextState.totalPortfolioValue, 1e-8);
+        const proposedNotional = risk.amount * input.currentPrice;
+        const proposedPct = proposedNotional / Math.max(nextState.totalPortfolioValue, 1e-8);
+
+        if (expectedEdge < runtimeConfig.minExpectedEdge || proposedPct > runtimeConfig.maxPositionSizePct || currentExposure + proposedPct > runtimeConfig.maxExposurePct) {
+          nextState = {
+            ...nextState,
+            aiWarnings: [`Risk filter blocked order. expectedEdge=${expectedEdge.toFixed(4)} proposedPct=${proposedPct.toFixed(4)} exposure=${currentExposure.toFixed(4)}`, ...nextState.aiWarnings].slice(0, 20),
+          };
+        } else {
         const simulation = simulateEntryExecution({
-          symbol: input.symbol,
+          symbol,
           action: ActionType.BUY,
           marketPrice: input.currentPrice,
           amount: risk.amount,
@@ -658,7 +740,7 @@ export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleRes
         });
 
         pendingTrade = {
-          symbol: input.symbol,
+          symbol,
           action: ActionType.BUY,
           price: simulation.entryPrice,
           amount: risk.amount,
@@ -674,7 +756,10 @@ export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleRes
           aiNotes: [...signal.notes, ...risk.notes],
           strategyVersion: strategy.version,
           simulation,
+          decisionId,
+          idempotencyKey: `${symbol}:${runtimeConfig.timeframe}:${decisionTs}:${signal.action}` ,
         };
+        }
       } else {
         nextState = {
           ...nextState,
@@ -685,7 +770,7 @@ export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleRes
 
     if (signal.action === ActionType.SELL && holdings > 0) {
       const simulation = simulateEntryExecution({
-        symbol: input.symbol,
+        symbol,
         action: ActionType.SELL,
         marketPrice: input.currentPrice,
         amount: holdings,
@@ -694,7 +779,7 @@ export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleRes
         feeRate: TRADING_FEE_RATE,
       });
       pendingTrade = {
-        symbol: input.symbol,
+        symbol,
         action: ActionType.SELL,
         price: simulation.entryPrice,
         amount: holdings,
@@ -736,7 +821,7 @@ export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleRes
     };
   }
 
-  nextState = recalculatePortfolioValue(nextState, input.symbol, input.currentPrice);
+  nextState = recalculatePortfolioValue(nextState, symbol, input.currentPrice);
   return { state: nextState, pendingTrade };
 };
 
@@ -747,6 +832,38 @@ export const confirmPendingTrade = (
 ): BotState => {
   const atr = pendingTrade.indicatorsSnapshot?.atr || Math.max(pendingTrade.price * 0.003, 1e-8);
   let nextState = state;
+  const orderId = `${pendingTrade.symbol}-${pendingTrade.action}-${Date.now()}`;
+  const decisionId = pendingTrade.decisionId || `${pendingTrade.symbol}-${Date.now()}-${pendingTrade.action}`;
+  const idempotencyKey = pendingTrade.idempotencyKey || `${pendingTrade.symbol}:${decisionId}:${pendingTrade.action}`;
+
+  if (tradeHistoryService.hasOrderForIdempotencyKey(idempotencyKey)) {
+    tradeHistoryService.recordOrder({
+      orderId,
+      decisionId,
+      idempotencyKey,
+      ts: Date.now(),
+      symbol: pendingTrade.symbol,
+      side: pendingTrade.action === ActionType.BUY ? 'BUY' : 'SELL',
+      qty: pendingTrade.amount,
+      requestedPrice: pendingTrade.price,
+      status: 'SKIPPED',
+      reason: 'Duplicate idempotency key on restart',
+    });
+    return state;
+  }
+
+  tradeHistoryService.recordOrder({
+    orderId,
+    decisionId,
+    idempotencyKey,
+    ts: Date.now(),
+    symbol: pendingTrade.symbol,
+    side: pendingTrade.action === ActionType.BUY ? 'BUY' : 'SELL',
+    qty: pendingTrade.amount,
+    requestedPrice: pendingTrade.price,
+    status: 'ACCEPTED',
+  });
+
   if (pendingTrade.action === ActionType.BUY) {
     nextState = executeBuyTrade(state, pendingTrade, atr);
   } else {
@@ -770,7 +887,26 @@ export const confirmPendingTrade = (
   }
 
   const currentPrice = pendingTrade.price;
-  return recalculatePortfolioValue(nextState, pendingTrade.symbol, currentPrice);
+  nextState = recalculatePortfolioValue(nextState, pendingTrade.symbol, currentPrice);
+  tradeHistoryService.recordFill({
+    fillId: `${orderId}-fill`,
+    orderId,
+    ts: Date.now(),
+    symbol: pendingTrade.symbol,
+    qty: pendingTrade.amount,
+    avgPrice: pendingTrade.price,
+    fees: pendingTrade.fee,
+    status: 'FILLED',
+  });
+  tradeHistoryService.recordPositionSnapshot({
+    ts: Date.now(),
+    symbol: pendingTrade.symbol,
+    balance: nextState.balance,
+    positionSize: nextState.holdings[pendingTrade.symbol] || 0,
+    avgEntryPrice: nextState.averageEntryPrices[pendingTrade.symbol] || 0,
+    totalPortfolioValue: nextState.totalPortfolioValue,
+  });
+  return nextState;
 };
 
 export const syncBotStateWithStrategy = (state: BotState): BotState => {
