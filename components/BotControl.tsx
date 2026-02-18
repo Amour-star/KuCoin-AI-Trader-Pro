@@ -32,6 +32,7 @@ const BotControl: React.FC<BotControlProps> = ({
 }) => {
   const pnl = state.totalPortfolioValue - 1000;
   const pnlPercent = (pnl / 1000) * 100;
+  const lastRefinedLabel = state.lastRefinementTime ? new Date(state.lastRefinementTime).toLocaleString() : 'Not refined yet';
 
   const getMarketStatusUI = (status: 'ACTIVE' | 'LOW_VOLATILITY' | 'OFFLINE') => {
     switch (status) {
@@ -138,6 +139,12 @@ const BotControl: React.FC<BotControlProps> = ({
                 </div>
                 <div className="w-full bg-slate-800 rounded-full h-1.5"><div className="bg-blue-600 h-1.5 rounded-full" style={{ width: `${(state.trainingDataLog.length / 500) * 100}%` }}></div></div>
                 <button onClick={onRetrain} disabled={state.isRunning} className="w-full py-1 text-[10px] font-bold uppercase bg-slate-800 border border-slate-700 rounded text-slate-400 hover:text-white transition">Force Sync</button>
+                <div className="pt-2 border-t border-slate-800/60 space-y-1">
+                    <div className="text-[9px] text-slate-500 uppercase font-bold tracking-wider">Strategy</div>
+                    <div className="text-[11px] text-slate-300 font-mono">{state.strategyVersion}</div>
+                    <div className="text-[10px] text-slate-500">Last refinement: {lastRefinedLabel}</div>
+                    <div className="text-[10px] text-blue-400 uppercase font-bold">{state.refinementStatus}</div>
+                </div>
             </div>
          )}
       </div>

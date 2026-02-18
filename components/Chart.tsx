@@ -19,18 +19,38 @@ interface ChartProps {
 }
 
 const Chart: React.FC<ChartProps> = ({ data, trades }) => {
-  // Prepare data for Recharts
-  // We use a ComposedChart to show Candles (custom Bar shape or ErrorBar logic) + Line indicators
-  // Simplifying to OHLC representation: High-Low line + Open-Close Bar
-  
-  const chartData = data.map(d => ({
-    ...d,
-    color: d.close > d.open ? '#10b981' : '#ef4444', // Green or Red
-    candleBodyTemp: [Math.min(d.open, d.close), Math.max(d.open, d.close)],
-    range: [d.low, d.high]
-  }));
+  const chartData = data.map(candle => {
+    const bodyBottom = Math.min(candle.open, candle.close);
+    const bodyHeight = Math.max(Math.abs(candle.close - candle.open), candle.close * 0.0002);
+    const wickBottom = candle.low;
+    const wickHeight = Math.max(candle.high - candle.low, candle.close * 0.0002);
 
-  const CustomTooltip = ({ active, payload, label }: any) => {
+    return {
+      ...candle,
+      color: candle.close >= candle.open ? '#10b981' : '#ef4444',
+      bodyBase: bodyBottom,
+      bodyHeight,
+      wickBase: wickBottom,
+      wickHeight,
+    };
+  });
+
+  const yDomain = React.useMemo<[number, number]>(() => {
+    if (chartData.length === 0) return [0, 1];
+    const lows = chartData.map(candle => candle.low);
+    const highs = chartData.map(candle => candle.high);
+    const min = Math.min(...lows);
+    const max = Math.max(...highs);
+    const range = Math.max(max - min, max * 0.005);
+    const pad = range * 0.06;
+    return [min - pad, max + pad];
+  }, [chartData]);
+
+  const CustomTooltip: React.FC<{
+    active?: boolean;
+    payload?: Array<{ payload: Candle }>;
+    label?: string;
+  }> = ({ active, payload }) => {
     if (active && payload && payload.length) {
       const d = payload[0].payload;
       return (
@@ -72,7 +92,7 @@ const Chart: React.FC<ChartProps> = ({ data, trades }) => {
                 minTickGap={30}
             />
             <YAxis 
-                domain={['auto', 'auto']} 
+                domain={yDomain}
                 orientation="right" 
                 stroke="#94a3b8" 
                 tick={{ fontSize: 10 }} 
@@ -82,13 +102,19 @@ const Chart: React.FC<ChartProps> = ({ data, trades }) => {
             />
             <Tooltip content={<CustomTooltip />} />
             
-            {/* Candle High-Low Line (Shadow) */}
-            <Bar dataKey="range" barSize={1} fill="#94a3b8" />
-            
-            {/* Candle Body */}
-            <Bar dataKey="candleBodyTemp" barSize={6}>
+            {/* Wick */}
+            <Bar stackId="wick" dataKey="wickBase" fill="transparent" isAnimationActive={false} />
+            <Bar stackId="wick" dataKey="wickHeight" barSize={1} isAnimationActive={false}>
               {chartData.map((entry, index) => (
-                <Cell key={`cell-${index}`} fill={entry.color} />
+                <Cell key={`wick-${index}`} fill={entry.color} />
+              ))}
+            </Bar>
+
+            {/* Body */}
+            <Bar stackId="body" dataKey="bodyBase" fill="transparent" isAnimationActive={false} />
+            <Bar stackId="body" dataKey="bodyHeight" barSize={6} isAnimationActive={false}>
+              {chartData.map((entry, index) => (
+                <Cell key={`body-${index}`} fill={entry.color} />
               ))}
             </Bar>
 

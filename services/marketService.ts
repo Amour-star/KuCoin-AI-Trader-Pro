@@ -25,7 +25,12 @@ for (const m of mockMarketData) {
 type KucoinBase = 'dev-proxy' | 'direct' | 'cors-proxy';
 
 const KUCOIN_ORIGIN = 'https://api.kucoin.com';
-const KUCOIN_BASES: KucoinBase[] = ['dev-proxy', 'direct', 'cors-proxy'];
+const useDevProxy = import.meta.env.VITE_USE_KUCOIN_DEV_PROXY === 'true';
+const KUCOIN_BASES: KucoinBase[] = useDevProxy
+  ? ['dev-proxy', 'direct', 'cors-proxy']
+  : ['direct', 'cors-proxy'];
+const BASE_COOLDOWN_MS = 45_000;
+const baseCooldownUntil: Partial<Record<KucoinBase, number>> = {};
 
 const buildKucoinUrl = (
   base: KucoinBase,
@@ -64,8 +69,12 @@ const fetchKucoinData = async <T>(
   params?: Record<string, string | number | undefined>
 ): Promise<T> => {
   let lastError: unknown = null;
+  const now = Date.now();
 
   for (const base of KUCOIN_BASES) {
+    const blockedUntil = baseCooldownUntil[base] || 0;
+    if (blockedUntil > now) continue;
+
     const url = buildKucoinUrl(base, path, params);
     try {
       const res = await fetchWithTimeout(url);
@@ -78,9 +87,11 @@ const fetchKucoinData = async <T>(
       if (payload?.data === undefined) {
         throw new Error(`Invalid KuCoin payload from ${base}`);
       }
+      baseCooldownUntil[base] = 0;
       return payload.data as T;
     } catch (err) {
       lastError = err;
+      baseCooldownUntil[base] = Date.now() + BASE_COOLDOWN_MS;
     }
   }
 
@@ -184,17 +195,23 @@ const generateFallbackCandles = (symbol: string, count: number = 100): Candle[] 
 
 export const fetchTopCoins = async (): Promise<MarketData[]> => {
   try {
-    type AllTickersData = { ticker: any[] };
+    interface KucoinTicker {
+      symbol: string;
+      last: string;
+      volValue: string;
+      changeRate: string;
+    }
+    type AllTickersData = { ticker: KucoinTicker[] };
     const data = await fetchKucoinData<AllTickersData>('/api/v1/market/allTickers');
     const tickers = Array.isArray(data?.ticker) ? data.ticker : [];
 
     const sorted = tickers
-      .filter((t: any) => isHotTradableUsdtSpot(t.symbol))
-      .map((t: any) => {
-        const symbol = String(t.symbol);
-        const price = asNumber(t.last);
-        const volume24h = asNumber(t.volValue);
-        const change24h = asNumber(t.changeRate) * 100;
+      .filter((ticker: KucoinTicker) => isHotTradableUsdtSpot(ticker.symbol))
+      .map((ticker: KucoinTicker) => {
+        const symbol = String(ticker.symbol);
+        const price = asNumber(ticker.last);
+        const volume24h = asNumber(ticker.volValue);
+        const change24h = asNumber(ticker.changeRate) * 100;
 
         return { symbol, price, volume24h, change24h };
       })
@@ -312,4 +329,3 @@ export const fetchLatestTicker = async (symbol: string): Promise<MarketData | nu
     };
   }
 };
-

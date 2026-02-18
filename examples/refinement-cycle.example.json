@@ -1,0 +1,31 @@
+{
+  "status": "applied",
+  "reason": "Candidate passed walk-forward safety checks.",
+  "summary": {
+    "version": "v13",
+    "lastRefinementTime": 1763539200000,
+    "warnings": [
+      "Win rate/profit factor below target. Raising minimum setup quality threshold."
+    ]
+  },
+  "suggestedChanges": {
+    "minScore": 0.73,
+    "atrMultiplier": 1.08
+  },
+  "metricsBefore": {
+    "closedTrades": 26,
+    "winRate": 42.3,
+    "expectancy": -0.83,
+    "avgR": -0.12,
+    "maxDrawdownPct": 7.2,
+    "profitFactor": 0.89
+  },
+  "metricsAfter": {
+    "closedTrades": 14,
+    "winRate": 57.1,
+    "expectancy": 1.14,
+    "avgR": 0.37,
+    "maxDrawdownPct": 4.5,
+    "profitFactor": 1.41
+  }
+}

@@ -6,6 +6,73 @@ export enum ActionType {
 
 export type TradeExitReason = 'SIGNAL' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'MANUAL';
 export type ConnectivityStatus = 'REALTIME' | 'SIMULATED' | 'CONNECTING';
+export type MarketStatus = 'ACTIVE' | 'LOW_VOLATILITY' | 'OFFLINE';
+export type MarketRegime = 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'CHOP' | 'HIGH_VOLATILITY';
+export type RefinementStatus = 'IDLE' | 'RUNNING' | 'APPLIED' | 'REJECTED' | 'FAILED';
+
+export interface IndicatorSnapshot {
+  emaShort: number;
+  emaLong: number;
+  rsi: number;
+  atr: number;
+  momentum: number;
+  volumeRatio: number;
+}
+
+export interface SetupScoreBreakdown {
+  pullbackToEma: number;
+  rsiRecovery: number;
+  momentumConfirmation: number;
+  volumeConfirmation: number;
+  trendAlignment: number;
+  total: number;
+  threshold: number;
+}
+
+export interface StrategyParameters {
+  minScore: number;
+  atrMultiplier: number;
+  stopLossATR: number;
+  takeProfitATR: number;
+  maxRiskPerTradePct: number;
+  dailyMaxLossPct: number;
+  maxConcurrentTrades: number;
+  killSwitchLosses: number;
+  minAtrPct: number;
+  maxAtrPct: number;
+}
+
+export interface StrategyVersionRecord {
+  version: string;
+  timestamp: number;
+  parameters: StrategyParameters;
+  notes: string[];
+}
+
+export interface StrategyState {
+  version: string;
+  parameters: StrategyParameters;
+  lastRefinementTime: number | null;
+  history: StrategyVersionRecord[];
+  warnings: string[];
+}
+
+export interface StrategySummary {
+  version: string;
+  lastRefinementTime: number | null;
+  warnings: string[];
+}
+
+export interface ExecutionSimulation {
+  entryPrice: number;
+  exitPrice: number;
+  pnl: number;
+  rMultiple: number;
+  reason: TradeExitReason | 'ENTRY';
+  spread: number;
+  slippage: number;
+  fees: number;
+}
 
 export interface Candle {
   time: string; // ISO string or formatted time
@@ -32,6 +99,15 @@ export interface Trade {
   stopLoss?: number;
   takeProfit?: number;
   exitReason?: TradeExitReason;
+  marketRegime?: MarketRegime;
+  setupScore?: number;
+  scoreBreakdown?: SetupScoreBreakdown;
+  indicatorsSnapshot?: IndicatorSnapshot;
+  entryReason?: string;
+  rMultiple?: number;
+  aiNotes?: string[];
+  strategyVersion?: string;
+  simulation?: ExecutionSimulation;
 }
 
 export interface Position {
@@ -42,6 +118,14 @@ export interface Position {
   stopLoss?: number;
   takeProfit?: number;
   timestamp: number;
+  initialRiskPerUnit?: number;
+  setupScore?: number;
+  marketRegime?: MarketRegime;
+  entryReason?: string;
+  indicatorsSnapshot?: IndicatorSnapshot;
+  aiNotes?: string[];
+  strategyVersion?: string;
+  entryFeePerUnit?: number;
 }
 
 export interface TrainingDataPoint {
@@ -49,8 +133,10 @@ export interface TrainingDataPoint {
   candle: Candle;
   action: ActionType;
   confidence: number;
-  marketStatus: 'ACTIVE' | 'LOW_VOLATILITY' | 'OFFLINE';
+  marketStatus: MarketStatus;
   pnl?: number;
+  setupScore?: number;
+  marketRegime?: MarketRegime;
 }
 
 export interface BotState {
@@ -63,10 +149,14 @@ export interface BotState {
   activePositions: Position[]; // Track individual open positions for SL/TP
   totalPortfolioValue: number;
   activeSymbol: string;
-  marketStatus: 'ACTIVE' | 'LOW_VOLATILITY' | 'OFFLINE';
+  marketStatus: MarketStatus;
   lastTrainingTime: number;
   trades: Trade[];
   trainingDataLog: TrainingDataPoint[];
+  strategyVersion: string;
+  lastRefinementTime: number | null;
+  refinementStatus: RefinementStatus;
+  aiWarnings: string[];
 }
 
 export interface MarketData {
@@ -85,4 +175,37 @@ export interface PendingTrade {
   fee: number;         // Estimated fee in USDT
   stopLoss?: number;
   takeProfit?: number;
+  marketRegime?: MarketRegime;
+  setupScore?: number;
+  scoreBreakdown?: SetupScoreBreakdown;
+  indicatorsSnapshot?: IndicatorSnapshot;
+  entryReason?: string;
+  aiNotes?: string[];
+  strategyVersion?: string;
+  simulation?: ExecutionSimulation;
+}
+
+export interface PerformanceMetrics {
+  totalTrades: number;
+  closedTrades: number;
+  winRate: number;
+  expectancy: number;
+  avgR: number;
+  maxDrawdownPct: number;
+  profitFactor: number;
+  grossProfit: number;
+  grossLossAbs: number;
+}
+
+export interface ConditionBucket {
+  key: string;
+  trades: number;
+  winRate: number;
+  expectancy: number;
+}
+
+export interface LossCluster {
+  label: string;
+  occurrences: number;
+  averageLoss: number;
 }

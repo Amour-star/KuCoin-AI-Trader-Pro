@@ -1,0 +1,20 @@
+{
+  "version": "v12",
+  "parameters": {
+    "minScore": 0.71,
+    "atrMultiplier": 1.12,
+    "stopLossATR": 1.52,
+    "takeProfitATR": 2.4,
+    "maxRiskPerTradePct": 0.012,
+    "dailyMaxLossPct": 0.04,
+    "maxConcurrentTrades": 2,
+    "killSwitchLosses": 3,
+    "minAtrPct": 0.002,
+    "maxAtrPct": 0.03
+  },
+  "lastRefinementTime": 1763452800000,
+  "warnings": [
+    "Reduced overtrading in chop regime.",
+    "Raised setup threshold after weak low-score cluster."
+  ]
+}

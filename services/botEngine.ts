@@ -1,340 +1,748 @@
-import { ActionType, BotState, Candle, Trade, PendingTrade, Position, TrainingDataPoint, TradeExitReason } from '../types';
 import { TRADING_FEE_RATE } from '../constants';
+import {
+  ActionType,
+  BotState,
+  Candle,
+  IndicatorSnapshot,
+  MarketRegime,
+  MarketStatus,
+  PendingTrade,
+  Position,
+  RefinementStatus,
+  SetupScoreBreakdown,
+  Trade,
+  TradeExitReason,
+} from '../types';
+import { runStrategyRefinementCycle } from './ai/strategyRefiner';
+import { simulateEntryExecution, simulateExitExecution } from './engine/executionSimulator';
+import { evaluateRisk } from './engine/riskManager';
+import { getStrategySummary, loadStrategyState } from './engine/strategyState';
+import { appendTrade } from './storage/tradeStorage';
+
+const REFINEMENT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const SCHEDULER_CHECK_MS = 60 * 1000;
+const MAX_TRAINING_LOG = 500;
+
+let tradeSequence = 0;
+let schedulerId: number | null = null;
+let refinementInFlight = false;
+
+interface EngineSignal {
+  action: ActionType;
+  confidence: number;
+  setupScore: number;
+  breakdown: SetupScoreBreakdown;
+  marketRegime: MarketRegime;
+  indicators: IndicatorSnapshot;
+  entryReason: string;
+  notes: string[];
+  atr: number;
+}
+
+interface ConsumePositionsResult {
+  positions: Position[];
+  consumedAmount: number;
+  weightedEntryPrice: number;
+  weightedRiskPerUnit: number;
+  weightedEntryFeePerUnit: number;
+  metadata: {
+    setupScore?: number;
+    marketRegime?: MarketRegime;
+    entryReason?: string;
+    indicatorsSnapshot?: IndicatorSnapshot;
+    aiNotes?: string[];
+    strategyVersion?: string;
+    stopLoss?: number;
+    takeProfit?: number;
+  };
+}
+
+export interface BotEngineCycleInput {
+  state: BotState;
+  symbol: string;
+  candles: Candle[];
+  currentPrice: number;
+  confidenceThreshold: number;
+}
+
+export interface BotEngineCycleResult {
+  state: BotState;
+  pendingTrade: PendingTrade | null;
+}
 
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
+const round = (value: number, decimals: number = 8): number => Number(value.toFixed(decimals));
 
-const getAverageRangePct = (candles: Candle[], length: number = 20): number => {
-  if (candles.length === 0) return 0;
-  const window = candles.slice(-length);
-  const ranges = window.map(c => (c.high - c.low) / (c.close || 1));
-  return ranges.reduce((acc, v) => acc + v, 0) / Math.max(ranges.length, 1);
+const generateTradeId = (symbol: string, type: ActionType, timestamp: number): string => {
+  tradeSequence += 1;
+  return `${symbol}-${type}-${timestamp}-${tradeSequence}`;
 };
 
-const getMomentum = (candles: Candle[], lookback: number): number => {
-  if (candles.length <= lookback) return 0;
-  const last = candles[candles.length - 1].close;
-  const previous = candles[candles.length - 1 - lookback].close;
-  return previous > 0 ? (last - previous) / previous : 0;
+const average = (values: number[]): number =>
+  values.length === 0 ? 0 : values.reduce((acc, value) => acc + value, 0) / values.length;
+
+const calculateAtr = (candles: Candle[], period: number = 14): number => {
+  if (candles.length < 2) return 0;
+  const trueRanges: number[] = [];
+  for (let i = 1; i < candles.length; i += 1) {
+    const current = candles[i];
+    const previous = candles[i - 1];
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close),
+    );
+    trueRanges.push(tr);
+  }
+  return average(trueRanges.slice(-period));
 };
 
-// Refined deterministic signal engine (trend + momentum + RSI + volatility + volume regime).
-export const getAgentAction = (candles: Candle[]): { action: ActionType; confidence: number } => {
-  if (candles.length < 25) {
-    return { action: ActionType.HOLD, confidence: 0.35 };
-  }
+const detectMarketRegime = (candle: Candle, atrPct: number, minAtrPct: number, maxAtrPct: number): MarketRegime => {
+  const emaShort = candle.emaShort || candle.close;
+  const emaLong = candle.emaLong || candle.close;
+  const trendGap = (emaShort - emaLong) / Math.max(candle.close, 1);
 
-  const current = candles[candles.length - 1];
-  const avgRangePct = getAverageRangePct(candles, 20);
-  const fastMomentum = getMomentum(candles, 3);
-  const slowMomentum = getMomentum(candles, 10);
+  if (atrPct < minAtrPct) return 'CHOP';
+  if (atrPct > maxAtrPct * 1.2) return 'HIGH_VOLATILITY';
 
-  const trendComponent = (current.emaShort && current.emaLong)
-    ? (current.emaShort - current.emaLong) / (current.close || 1)
-    : 0;
+  if (trendGap > 0.0015 && candle.close >= emaShort) return 'TRENDING_UP';
+  if (trendGap < -0.0015 && candle.close <= emaShort) return 'TRENDING_DOWN';
+  return 'RANGING';
+};
 
-  const rsiComponent = typeof current.rsi === 'number'
-    ? (50 - current.rsi) / 50 // >0 buy bias, <0 sell bias
-    : 0;
+const toMarketStatus = (regime: MarketRegime): MarketStatus => {
+  if (regime === 'CHOP') return 'LOW_VOLATILITY';
+  return 'ACTIVE';
+};
 
-  const avgVolume = candles.slice(-20).reduce((acc, c) => acc + c.volume, 0) / 20;
-  const volumeComponent = avgVolume > 0 ? ((current.volume - avgVolume) / avgVolume) : 0;
+const scoreSetup = (
+  candles: Candle[],
+  current: Candle,
+  regime: MarketRegime,
+  threshold: number,
+): { score: number; breakdown: SetupScoreBreakdown; entryReason: string } => {
+  const previous = candles[candles.length - 2] || current;
+  const emaShort = current.emaShort || current.close;
+  const emaLong = current.emaLong || current.close;
+  const avgVolume = average(candles.slice(-20).map(candle => candle.volume));
+  const volumeRatio = avgVolume > 0 ? current.volume / avgVolume : 1;
+  const momentum = previous.close > 0 ? (current.close - previous.close) / previous.close : 0;
+  const rsi = current.rsi ?? 50;
+  const rsiPrev = previous.rsi ?? rsi;
 
-  // Refinement score (higher absolute score => stronger conviction).
-  const rawScore =
-    (trendComponent * 8.0) * 0.35 +
-    (fastMomentum * 6.0) * 0.25 +
-    (slowMomentum * 4.0) * 0.20 +
-    (rsiComponent) * 0.15 +
-    (volumeComponent) * 0.05;
+  const pullbackDistancePct = Math.abs(current.close - emaShort) / Math.max(current.close, 1);
+  const pullbackToEma = clamp(1 - pullbackDistancePct / 0.0035, 0, 1);
+  const rsiRecovery = clamp(((rsi - 45) / 20) + (rsi > rsiPrev ? 0.2 : 0), 0, 1);
+  const momentumConfirmation = clamp((momentum / 0.004) + (current.close > previous.close ? 0.3 : 0), 0, 1);
+  const volumeConfirmation = clamp((volumeRatio - 0.9) / 0.4, 0, 1);
+  const trendAlignment = regime === 'TRENDING_UP' ? 1 : regime === 'RANGING' ? 0.45 : 0;
 
-  // Penalize very low or very high volatility regimes.
-  const volatilityPenalty =
-    avgRangePct < 0.0012 ? 0.80 :
-    avgRangePct > 0.03 ? 0.85 :
-    1.0;
+  const score = clamp(
+    pullbackToEma * 0.22 +
+      rsiRecovery * 0.20 +
+      momentumConfirmation * 0.20 +
+      volumeConfirmation * 0.16 +
+      trendAlignment * 0.22,
+    0,
+    1,
+  );
 
-  const score = rawScore * volatilityPenalty;
-  const absScore = Math.abs(score);
-
-  if (absScore < 0.18) {
-    return { action: ActionType.HOLD, confidence: clamp(0.45 - absScore, 0.2, 0.45) };
-  }
+  const entryReason = `Confluence ${score.toFixed(2)} | pullback ${pullbackToEma.toFixed(2)} | rsi ${rsiRecovery.toFixed(2)} | momentum ${momentumConfirmation.toFixed(2)} | volume ${volumeConfirmation.toFixed(2)} | trend ${trendAlignment.toFixed(2)}`;
 
   return {
-    action: score > 0 ? ActionType.BUY : ActionType.SELL,
-    confidence: clamp(0.55 + absScore, 0.55, 0.95),
+    score,
+    breakdown: {
+      pullbackToEma,
+      rsiRecovery,
+      momentumConfirmation,
+      volumeConfirmation,
+      trendAlignment,
+      total: score,
+      threshold,
+    },
+    entryReason,
   };
 };
 
-export const getTradePreview = (
-    state: BotState,
-    action: ActionType,
-    price: number,
-    symbol: string,
-    candles: Candle[]
-): PendingTrade | null => {
-    const avgRangePct = getAverageRangePct(candles, 20);
+const deriveSignal = (state: BotState, candles: Candle[]): EngineSignal => {
+  const strategy = loadStrategyState();
+  if (candles.length < 30) {
+    const fallback: IndicatorSnapshot = {
+      emaShort: candles[candles.length - 1]?.close || 0,
+      emaLong: candles[candles.length - 1]?.close || 0,
+      rsi: candles[candles.length - 1]?.rsi ?? 50,
+      atr: 0,
+      momentum: 0,
+      volumeRatio: 1,
+    };
+    return {
+      action: ActionType.HOLD,
+      confidence: 0.2,
+      setupScore: 0,
+      breakdown: {
+        pullbackToEma: 0,
+        rsiRecovery: 0,
+        momentumConfirmation: 0,
+        volumeConfirmation: 0,
+        trendAlignment: 0,
+        total: 0,
+        threshold: strategy.parameters.minScore,
+      },
+      marketRegime: 'CHOP',
+      indicators: fallback,
+      entryReason: 'Insufficient candles for setup scoring.',
+      notes: ['Waiting for enough history before evaluating entries.'],
+      atr: 0,
+    };
+  }
 
-    if (action === ActionType.BUY) {
-        // Volatility-aware sizing for paper mode.
-        const normalizedVol = clamp(avgRangePct / 0.02, 0, 1.5);
-        const allocationPct = clamp(0.22 - normalizedVol * 0.08, 0.08, 0.22);
-        const tradeValueUSDT = state.balance * allocationPct;
-        if (tradeValueUSDT <= 10) return null; // Minimum trade size
+  const current = candles[candles.length - 1];
+  const previous = candles[candles.length - 2];
+  const atr = calculateAtr(candles, 14);
+  const atrPct = atr / Math.max(current.close, 1);
+  const regime = detectMarketRegime(current, atrPct, strategy.parameters.minAtrPct, strategy.parameters.maxAtrPct);
+  const { score, breakdown, entryReason } = scoreSetup(candles, current, regime, strategy.parameters.minScore);
+  const avgVolume = average(candles.slice(-20).map(candle => candle.volume));
+  const volumeRatio = avgVolume > 0 ? current.volume / avgVolume : 1;
+  const momentum = previous.close > 0 ? (current.close - previous.close) / previous.close : 0;
 
-        const fee = tradeValueUSDT * TRADING_FEE_RATE;
-        const amountCrypto = (tradeValueUSDT - fee) / price;
+  const indicators: IndicatorSnapshot = {
+    emaShort: current.emaShort || current.close,
+    emaLong: current.emaLong || current.close,
+    rsi: current.rsi ?? 50,
+    atr,
+    momentum,
+    volumeRatio,
+  };
 
-        // Dynamic SL/TP based on current volatility regime.
-        const stopLossPct = clamp(avgRangePct * 1.8, 0.008, 0.03);
-        const takeProfitPct = clamp(stopLossPct * 1.9, 0.016, 0.07);
-        const stopLoss = price * (1 - stopLossPct);
-        const takeProfit = price * (1 + takeProfitPct);
+  let action = ActionType.HOLD;
+  if (regime === 'TRENDING_UP' && score >= strategy.parameters.minScore) {
+    action = ActionType.BUY;
+  } else if ((regime === 'TRENDING_DOWN' || regime === 'HIGH_VOLATILITY') && (state.holdings[state.activeSymbol] || 0) > 0) {
+    action = ActionType.SELL;
+  }
 
-        return {
-            symbol,
-            action,
-            price,
-            amount: amountCrypto,
-            totalValue: tradeValueUSDT,
-            fee,
-            stopLoss,
-            takeProfit
-        };
-    } else if (action === ActionType.SELL) {
-        const currentHolding = state.holdings[symbol] || 0;
-        if (currentHolding <= 0) return null;
+  const confidenceBase = 0.35 + score * 0.55;
+  const confidencePenalty = regime === 'CHOP' ? 0.2 : regime === 'HIGH_VOLATILITY' ? 0.12 : 0;
+  const confidence = clamp(confidenceBase - confidencePenalty, 0.1, 0.95);
 
-        // Default to selling 100% of holdings
-        const sellPercentage = 1.0; 
-        const amountToSell = currentHolding * sellPercentage;
+  const notes: string[] = [];
+  if (regime === 'CHOP') notes.push('Chop regime detected; skipping low-volatility setups.');
+  if (regime === 'HIGH_VOLATILITY') notes.push('High volatility regime; risk tightened.');
+  if (score < strategy.parameters.minScore) notes.push('Setup score below threshold.');
 
-        if (amountToSell <= 0) return null;
-
-        const grossValue = amountToSell * price;
-        const fee = grossValue * TRADING_FEE_RATE;
-
-        return {
-            symbol,
-            action,
-            price,
-            amount: amountToSell,
-            totalValue: grossValue,
-            fee
-        };
-    }
-    return null;
+  return {
+    action,
+    confidence,
+    setupScore: score,
+    breakdown,
+    marketRegime: regime,
+    indicators,
+    entryReason,
+    notes,
+    atr,
+  };
 };
 
-export const executeTrade = (
-    state: BotState, 
-    action: ActionType, 
-    price: number, 
-    symbol: string,
-    amount?: number, // Explicit amount to trade (crypto units)
-    stopLoss?: number,
-    takeProfit?: number,
-    metadata?: { exitReason?: TradeExitReason }
-): BotState => {
-    let newState = { ...state };
-    
-    // Ensure data structures exist
-    if (!newState.averageEntryPrices) newState.averageEntryPrices = {};
-    if (!newState.activePositions) newState.activePositions = [];
+const recalculateSymbolState = (state: BotState, symbol: string): BotState => {
+  const symbolPositions = state.activePositions.filter(position => position.symbol === symbol);
+  const totalAmount = symbolPositions.reduce((acc, position) => acc + position.amount, 0);
+  const totalCost = symbolPositions.reduce((acc, position) => acc + position.entryPrice * position.amount, 0);
 
-    if (action === ActionType.BUY) {
-        let tradeAmountUSDT = 0;
-        let amountCrypto = 0;
-        let fee = 0;
+  const holdings = { ...state.holdings, [symbol]: round(Math.max(totalAmount, 0), 8) };
+  const averageEntryPrices = {
+    ...state.averageEntryPrices,
+    [symbol]: totalAmount > 0 ? round(totalCost / totalAmount, 6) : 0,
+  };
 
-        if (amount) {
-            amountCrypto = amount;
-            tradeAmountUSDT = (amountCrypto * price) / (1 - TRADING_FEE_RATE);
-            fee = tradeAmountUSDT * TRADING_FEE_RATE;
-        } else {
-            tradeAmountUSDT = newState.balance * 0.2; 
-            if (tradeAmountUSDT <= 10) return newState; // Too small
-            fee = tradeAmountUSDT * TRADING_FEE_RATE;
-            amountCrypto = (tradeAmountUSDT - fee) / price;
-        }
-
-        if (newState.balance >= tradeAmountUSDT) {
-            // Update Average Entry Price
-            const currentHolding = newState.holdings[symbol] || 0;
-            const currentAvgPrice = newState.averageEntryPrices[symbol] || 0;
-            
-            const currentTotalCost = currentHolding * currentAvgPrice;
-            const newTotalCost = currentTotalCost + tradeAmountUSDT; 
-            const newTotalHolding = currentHolding + amountCrypto;
-            
-            newState.averageEntryPrices[symbol] = newTotalHolding > 0 ? newTotalCost / newTotalHolding : 0;
-            newState.balance -= tradeAmountUSDT;
-            newState.holdings[symbol] = newTotalHolding;
-            
-            const tradeId = Math.random().toString(36).substr(2, 9);
-            const trade: Trade = {
-                id: tradeId,
-                symbol,
-                type: ActionType.BUY,
-                price,
-                amount: amountCrypto,
-                timestamp: Date.now(),
-                fee: fee,
-                stopLoss: stopLoss,
-                takeProfit: takeProfit
-            };
-            newState.trades = [trade, ...newState.trades];
-
-            // Create new Open Position for tracking SL/TP
-            const newPosition: Position = {
-                id: tradeId,
-                symbol,
-                entryPrice: price,
-                amount: amountCrypto,
-                stopLoss,
-                takeProfit,
-                timestamp: Date.now()
-            };
-            newState.activePositions = [...newState.activePositions, newPosition];
-        }
-
-    } else if (action === ActionType.SELL) {
-        const currentHolding = newState.holdings[symbol] || 0;
-        const sellAmount = amount !== undefined ? amount : currentHolding;
-        const finalSellAmount = Math.min(sellAmount, currentHolding);
-
-        if (finalSellAmount > 0) {
-            const revenue = finalSellAmount * price;
-            const feeCost = revenue * TRADING_FEE_RATE;
-            const netRevenue = revenue - feeCost;
-
-            // Calculate PnL
-            const avgEntryPrice = newState.averageEntryPrices[symbol] || 0;
-            const costBasis = finalSellAmount * avgEntryPrice;
-            const pnl = netRevenue - costBasis;
-
-            newState.balance += netRevenue;
-            newState.holdings[symbol] = currentHolding - finalSellAmount;
-            
-            if (newState.holdings[symbol] <= 0.000001) {
-                 newState.holdings[symbol] = 0;
-                 newState.averageEntryPrices[symbol] = 0;
-            }
-
-            const trade: Trade = {
-                id: Math.random().toString(36).substr(2, 9),
-                symbol,
-                type: ActionType.SELL,
-                price,
-                amount: finalSellAmount,
-                timestamp: Date.now(),
-                fee: feeCost,
-                pnl: pnl,
-                stopLoss,
-                takeProfit,
-                exitReason: metadata?.exitReason || 'SIGNAL',
-            };
-            newState.trades = [trade, ...newState.trades];
-
-            // Reconcile activePositions
-            // FIFO: Reduce amount from oldest positions of this symbol until requirement met
-            let remainingToSell = finalSellAmount;
-            
-            newState.activePositions = newState.activePositions.map(pos => {
-                if (pos.symbol !== symbol || remainingToSell <= 0) return pos;
-
-                if (pos.amount <= remainingToSell) {
-                    remainingToSell -= pos.amount;
-                    return null; // Mark for deletion
-                } else {
-                    const updatedPos = { 
-                        ...pos, 
-                        amount: pos.amount - remainingToSell
-                    };
-                    
-                    // Update SL/TP if new values provided
-                    if (stopLoss !== undefined) updatedPos.stopLoss = stopLoss;
-                    if (takeProfit !== undefined) updatedPos.takeProfit = takeProfit;
-
-                    remainingToSell = 0;
-                    return updatedPos;
-                }
-            }).filter((pos): pos is Position => pos !== null);
-        }
-    }
-
-    // Recalculate Portfolio Value
-    const holdingsValue = Object.entries(newState.holdings).reduce((acc, [sym, amt]) => {
-        if (sym === symbol) return acc + amt * price;
-        return acc; 
-    }, 0);
-    
-    const otherHoldingsValue = Object.entries(newState.holdings).reduce((acc, [sym, amt]) => {
-        if (sym !== symbol) {
-             const entry = newState.averageEntryPrices[sym] || 0;
-             return acc + amt * entry;
-        }
-        return acc;
-    }, 0);
-
-    newState.totalPortfolioValue = newState.balance + holdingsValue + otherHoldingsValue;
-
-    return newState;
+  return { ...state, holdings, averageEntryPrices };
 };
 
-// Check open positions and auto-sell if SL/TP hit
-export const checkAutoExits = (
-    state: BotState, 
-    currentPrice: number, 
-    symbol: string,
-    currentCandle: Candle
-): BotState => {
-    let newState = { ...state };
-    if (!newState.activePositions) return newState;
+const recalculatePortfolioValue = (state: BotState, symbol: string, currentPrice: number): BotState => {
+  const holdingsValue = Object.entries(state.holdings).reduce((acc, [asset, amount]) => {
+    if (amount <= 0) return acc;
+    if (asset === symbol) return acc + amount * currentPrice;
+    return acc + amount * (state.averageEntryPrices[asset] || 0);
+  }, 0);
 
-    // Filter for positions of the current active symbol
-    const symbolPositions = newState.activePositions.filter(p => p.symbol === symbol);
+  return {
+    ...state,
+    totalPortfolioValue: round(state.balance + holdingsValue, 4),
+  };
+};
 
-    for (const pos of symbolPositions) {
-        let triggeredAction: TradeExitReason | null = null;
+const recordTrade = (state: BotState, trade: Trade): BotState => {
+  appendTrade(trade);
+  return {
+    ...state,
+    trades: [trade, ...state.trades].slice(0, 2000),
+  };
+};
 
-        // Check Stop Loss
-        if (pos.stopLoss && currentPrice <= pos.stopLoss) {
-            triggeredAction = 'STOP_LOSS';
-        }
-        // Check Take Profit
-        else if (pos.takeProfit && currentPrice >= pos.takeProfit) {
-            triggeredAction = 'TAKE_PROFIT';
-        }
+const consumePositions = (
+  state: BotState,
+  symbol: string,
+  amountRequested: number,
+  targetPositionId?: string,
+): ConsumePositionsResult => {
+  let remaining = amountRequested;
+  let weightedEntryPrice = 0;
+  let weightedRisk = 0;
+  let weightedEntryFee = 0;
+  let consumedAmount = 0;
+  const metadata: ConsumePositionsResult['metadata'] = {};
+  const nextPositions: Position[] = [];
 
-        if (triggeredAction) {
-            // Execute Sell for this specific position amount
-            newState = executeTrade(
-                newState,
-                ActionType.SELL,
-                currentPrice,
-                symbol,
-                pos.amount,
-                pos.stopLoss,
-                pos.takeProfit,
-                { exitReason: triggeredAction }
-            );
-
-            // Log this specific auto-action to training log
-            const lastTrade = newState.trades[0]; // The one just created
-             const logEntry: TrainingDataPoint = {
-                timestamp: Date.now(),
-                candle: currentCandle,
-                action: ActionType.SELL,
-                confidence: 1.0, 
-                marketStatus: newState.marketStatus,
-                pnl: lastTrade.pnl
-            };
-            newState.trainingDataLog = [logEntry, ...newState.trainingDataLog].slice(0, 500);
-            
-            console.log(`Auto-Exit Triggered: ${triggeredAction} for ${symbol} at ${currentPrice}`);
-        }
+  for (const position of state.activePositions) {
+    if (position.symbol !== symbol) {
+      nextPositions.push(position);
+      continue;
     }
 
-    return newState;
+    if (targetPositionId && position.id !== targetPositionId) {
+      nextPositions.push(position);
+      continue;
+    }
+
+    if (remaining <= 0) {
+      nextPositions.push(position);
+      continue;
+    }
+
+    const consume = Math.min(position.amount, remaining);
+    const keep = position.amount - consume;
+
+    consumedAmount += consume;
+    weightedEntryPrice += position.entryPrice * consume;
+    weightedRisk +=
+      (position.initialRiskPerUnit || Math.max(position.entryPrice - (position.stopLoss || position.entryPrice * 0.995), 1e-8)) *
+      consume;
+    weightedEntryFee += (position.entryFeePerUnit || 0) * consume;
+
+    if (!metadata.marketRegime) metadata.marketRegime = position.marketRegime;
+    if (!metadata.entryReason) metadata.entryReason = position.entryReason;
+    if (!metadata.indicatorsSnapshot) metadata.indicatorsSnapshot = position.indicatorsSnapshot;
+    if (!metadata.aiNotes) metadata.aiNotes = position.aiNotes;
+    if (!metadata.strategyVersion) metadata.strategyVersion = position.strategyVersion;
+    if (metadata.setupScore === undefined && typeof position.setupScore === 'number') metadata.setupScore = position.setupScore;
+    if (metadata.stopLoss === undefined) metadata.stopLoss = position.stopLoss;
+    if (metadata.takeProfit === undefined) metadata.takeProfit = position.takeProfit;
+
+    remaining -= consume;
+
+    if (keep > 0) {
+      nextPositions.push({
+        ...position,
+        amount: round(keep, 8),
+      });
+    }
+  }
+
+  if (consumedAmount <= 0) {
+    return {
+      positions: state.activePositions,
+      consumedAmount: 0,
+      weightedEntryPrice: 0,
+      weightedRiskPerUnit: 0,
+      weightedEntryFeePerUnit: 0,
+      metadata,
+    };
+  }
+
+  return {
+    positions: nextPositions,
+    consumedAmount: round(consumedAmount, 8),
+    weightedEntryPrice: weightedEntryPrice / consumedAmount,
+    weightedRiskPerUnit: weightedRisk / consumedAmount,
+    weightedEntryFeePerUnit: weightedEntryFee / consumedAmount,
+    metadata,
+  };
+};
+
+const executeBuyTrade = (state: BotState, pending: PendingTrade, atr: number): BotState => {
+  const timestamp = Date.now();
+  const simulation =
+    pending.simulation ||
+    simulateEntryExecution({
+      symbol: pending.symbol,
+      action: ActionType.BUY,
+      marketPrice: pending.price,
+      amount: pending.amount,
+      atr,
+      timestamp,
+      feeRate: TRADING_FEE_RATE,
+    });
+
+  const totalCost = simulation.entryPrice * pending.amount + simulation.fees;
+  if (totalCost > state.balance) return state;
+
+  const nextStateBase: BotState = {
+    ...state,
+    balance: round(state.balance - totalCost, 6),
+  };
+
+  const trade: Trade = {
+    id: generateTradeId(pending.symbol, ActionType.BUY, timestamp),
+    symbol: pending.symbol,
+    type: ActionType.BUY,
+    price: simulation.entryPrice,
+    amount: pending.amount,
+    timestamp,
+    fee: simulation.fees,
+    stopLoss: pending.stopLoss,
+    takeProfit: pending.takeProfit,
+    marketRegime: pending.marketRegime,
+    setupScore: pending.setupScore,
+    scoreBreakdown: pending.scoreBreakdown,
+    indicatorsSnapshot: pending.indicatorsSnapshot,
+    entryReason: pending.entryReason,
+    aiNotes: pending.aiNotes,
+    strategyVersion: pending.strategyVersion,
+    simulation,
+  };
+
+  const position: Position = {
+    id: trade.id,
+    symbol: pending.symbol,
+    entryPrice: simulation.entryPrice,
+    amount: pending.amount,
+    stopLoss: pending.stopLoss,
+    takeProfit: pending.takeProfit,
+    timestamp,
+    initialRiskPerUnit: Math.max(simulation.entryPrice - (pending.stopLoss || simulation.entryPrice * 0.995), 1e-8),
+    setupScore: pending.setupScore,
+    marketRegime: pending.marketRegime,
+    entryReason: pending.entryReason,
+    indicatorsSnapshot: pending.indicatorsSnapshot,
+    aiNotes: pending.aiNotes,
+    strategyVersion: pending.strategyVersion,
+    entryFeePerUnit: simulation.fees / Math.max(pending.amount, 1e-8),
+  };
+
+  const withTrade = recordTrade(nextStateBase, trade);
+  const withPosition = {
+    ...withTrade,
+    activePositions: [...withTrade.activePositions, position],
+  };
+  return recalculateSymbolState(withPosition, pending.symbol);
+};
+
+const executeSellTrade = (
+  state: BotState,
+  params: {
+    symbol: string;
+    amount: number;
+    marketPrice: number;
+    atr: number;
+    exitReason: TradeExitReason;
+    targetPositionId?: string;
+    fallbackMetadata?: {
+      setupScore?: number;
+      marketRegime?: MarketRegime;
+      entryReason?: string;
+      indicatorsSnapshot?: IndicatorSnapshot;
+      aiNotes?: string[];
+      strategyVersion?: string;
+      stopLoss?: number;
+      takeProfit?: number;
+    };
+  },
+): BotState => {
+  const timestamp = Date.now();
+  const consumed = consumePositions(state, params.symbol, params.amount, params.targetPositionId);
+  if (consumed.consumedAmount <= 0) return state;
+
+  const metadata = {
+    ...consumed.metadata,
+    ...params.fallbackMetadata,
+  };
+  const entryPrice = consumed.weightedEntryPrice;
+  const entryFee = consumed.weightedEntryFeePerUnit * consumed.consumedAmount;
+  const simulation = simulateExitExecution({
+    symbol: params.symbol,
+    marketPrice: params.marketPrice,
+    entryPrice,
+    amount: consumed.consumedAmount,
+    atr: params.atr,
+    timestamp,
+    reason: params.exitReason,
+    initialRiskPerUnit: consumed.weightedRiskPerUnit,
+    entryFee,
+    feeRate: TRADING_FEE_RATE,
+  });
+
+  const exitFee = simulation.exitPrice * consumed.consumedAmount * TRADING_FEE_RATE;
+  const netRevenue = simulation.exitPrice * consumed.consumedAmount - exitFee;
+  const costBasis = entryPrice * consumed.consumedAmount + entryFee;
+  const pnl = netRevenue - costBasis;
+
+  const nextStateBase: BotState = {
+    ...state,
+    balance: round(state.balance + netRevenue, 6),
+    activePositions: consumed.positions,
+  };
+
+  const trade: Trade = {
+    id: generateTradeId(params.symbol, ActionType.SELL, timestamp),
+    symbol: params.symbol,
+    type: ActionType.SELL,
+    price: simulation.exitPrice,
+    amount: consumed.consumedAmount,
+    timestamp,
+    fee: exitFee,
+    pnl: round(pnl, 6),
+    stopLoss: metadata.stopLoss,
+    takeProfit: metadata.takeProfit,
+    exitReason: params.exitReason,
+    marketRegime: metadata.marketRegime,
+    setupScore: metadata.setupScore,
+    indicatorsSnapshot: metadata.indicatorsSnapshot,
+    entryReason: metadata.entryReason,
+    rMultiple: simulation.rMultiple,
+    aiNotes: metadata.aiNotes,
+    strategyVersion: metadata.strategyVersion,
+    simulation: {
+      ...simulation,
+      pnl: round(pnl, 6),
+    },
+  };
+
+  const withTrade = recordTrade(nextStateBase, trade);
+  return recalculateSymbolState(withTrade, params.symbol);
+};
+
+const processAutoExits = (state: BotState, symbol: string, marketPrice: number, atr: number): BotState => {
+  let nextState = state;
+  const positions = state.activePositions.filter(position => position.symbol === symbol);
+
+  for (const position of positions) {
+    if (position.stopLoss && marketPrice <= position.stopLoss) {
+      nextState = executeSellTrade(nextState, {
+        symbol,
+        amount: position.amount,
+        marketPrice,
+        atr,
+        exitReason: 'STOP_LOSS',
+        targetPositionId: position.id,
+      });
+      continue;
+    }
+
+    if (position.takeProfit && marketPrice >= position.takeProfit) {
+      nextState = executeSellTrade(nextState, {
+        symbol,
+        amount: position.amount,
+        marketPrice,
+        atr,
+        exitReason: 'TAKE_PROFIT',
+        targetPositionId: position.id,
+      });
+    }
+  }
+
+  return nextState;
+};
+
+const maybeScheduleRefinement = (): void => {
+  if (refinementInFlight) return;
+  const summary = getStrategySummary();
+  const last = summary.lastRefinementTime || 0;
+  if (Date.now() - last < REFINEMENT_INTERVAL_MS) return;
+
+  refinementInFlight = true;
+  void runStrategyRefinementCycle().finally(() => {
+    refinementInFlight = false;
+  });
+};
+
+export const ensureRefinementScheduler = (): void => {
+  if (typeof window === 'undefined' || schedulerId !== null) return;
+  schedulerId = window.setInterval(() => {
+    maybeScheduleRefinement();
+  }, SCHEDULER_CHECK_MS);
+  maybeScheduleRefinement();
+};
+
+export const triggerStrategyRefinement = async (): Promise<RefinementStatus> => {
+  if (refinementInFlight) return 'RUNNING';
+  refinementInFlight = true;
+  try {
+    const result = await runStrategyRefinementCycle();
+    if (result.status === 'applied') return 'APPLIED';
+    if (result.status === 'failed') return 'FAILED';
+    if (result.status === 'rejected') return 'REJECTED';
+    return 'IDLE';
+  } finally {
+    refinementInFlight = false;
+  }
+};
+
+export const runBotEngineCycle = (input: BotEngineCycleInput): BotEngineCycleResult => {
+  ensureRefinementScheduler();
+  maybeScheduleRefinement();
+
+  const strategy = loadStrategyState();
+  const signal = deriveSignal(input.state, input.candles);
+  let nextState: BotState = {
+    ...input.state,
+    strategyVersion: strategy.version,
+    lastRefinementTime: strategy.lastRefinementTime,
+    aiWarnings: strategy.warnings,
+    marketStatus: toMarketStatus(signal.marketRegime),
+  };
+
+  nextState = processAutoExits(nextState, input.symbol, input.currentPrice, Math.max(signal.atr, 1e-8));
+
+  let pendingTrade: PendingTrade | null = null;
+  const holdings = nextState.holdings[input.symbol] || 0;
+  const confidenceEligible = signal.confidence >= input.confidenceThreshold;
+
+  if (nextState.isRunning && confidenceEligible) {
+    if (signal.action === ActionType.BUY) {
+      const risk = evaluateRisk({
+        state: nextState,
+        symbol: input.symbol,
+        action: ActionType.BUY,
+        price: input.currentPrice,
+        atr: Math.max(signal.atr, 1e-8),
+        setupScore: signal.setupScore,
+        marketRegime: signal.marketRegime,
+        parameters: strategy.parameters,
+      });
+
+      if (risk.allowed) {
+        const simulation = simulateEntryExecution({
+          symbol: input.symbol,
+          action: ActionType.BUY,
+          marketPrice: input.currentPrice,
+          amount: risk.amount,
+          atr: Math.max(signal.atr, 1e-8),
+          timestamp: Date.now(),
+          feeRate: TRADING_FEE_RATE,
+        });
+
+        pendingTrade = {
+          symbol: input.symbol,
+          action: ActionType.BUY,
+          price: simulation.entryPrice,
+          amount: risk.amount,
+          totalValue: simulation.entryPrice * risk.amount + simulation.fees,
+          fee: simulation.fees,
+          stopLoss: risk.stopLoss,
+          takeProfit: risk.takeProfit,
+          marketRegime: signal.marketRegime,
+          setupScore: signal.setupScore,
+          scoreBreakdown: signal.breakdown,
+          indicatorsSnapshot: signal.indicators,
+          entryReason: signal.entryReason,
+          aiNotes: [...signal.notes, ...risk.notes],
+          strategyVersion: strategy.version,
+          simulation,
+        };
+      } else {
+        nextState = {
+          ...nextState,
+          aiWarnings: [risk.reason, ...nextState.aiWarnings].slice(0, 20),
+        };
+      }
+    }
+
+    if (signal.action === ActionType.SELL && holdings > 0) {
+      const simulation = simulateEntryExecution({
+        symbol: input.symbol,
+        action: ActionType.SELL,
+        marketPrice: input.currentPrice,
+        amount: holdings,
+        atr: Math.max(signal.atr, 1e-8),
+        timestamp: Date.now(),
+        feeRate: TRADING_FEE_RATE,
+      });
+      pendingTrade = {
+        symbol: input.symbol,
+        action: ActionType.SELL,
+        price: simulation.entryPrice,
+        amount: holdings,
+        totalValue: simulation.entryPrice * holdings,
+        fee: simulation.fees,
+        marketRegime: signal.marketRegime,
+        setupScore: signal.setupScore,
+        scoreBreakdown: signal.breakdown,
+        indicatorsSnapshot: signal.indicators,
+        entryReason: 'Defensive exit: trend deterioration detected.',
+        aiNotes: signal.notes,
+        strategyVersion: strategy.version,
+        simulation,
+      };
+    }
+  }
+
+  if (pendingTrade && nextState.autoPaperTrading) {
+    nextState = confirmPendingTrade(nextState, pendingTrade, 'SIGNAL');
+    pendingTrade = null;
+  }
+
+  const currentCandle = input.candles[input.candles.length - 1];
+  if (currentCandle) {
+    nextState = {
+      ...nextState,
+      trainingDataLog: [
+        {
+          timestamp: Date.now(),
+          candle: currentCandle,
+          action: signal.action,
+          confidence: signal.confidence,
+          marketStatus: nextState.marketStatus,
+          setupScore: signal.setupScore,
+          marketRegime: signal.marketRegime,
+        },
+        ...nextState.trainingDataLog,
+      ].slice(0, MAX_TRAINING_LOG),
+    };
+  }
+
+  nextState = recalculatePortfolioValue(nextState, input.symbol, input.currentPrice);
+  return { state: nextState, pendingTrade };
+};
+
+export const confirmPendingTrade = (
+  state: BotState,
+  pendingTrade: PendingTrade,
+  exitReason: TradeExitReason = 'MANUAL',
+): BotState => {
+  const atr = pendingTrade.indicatorsSnapshot?.atr || Math.max(pendingTrade.price * 0.003, 1e-8);
+  let nextState = state;
+  if (pendingTrade.action === ActionType.BUY) {
+    nextState = executeBuyTrade(state, pendingTrade, atr);
+  } else {
+    nextState = executeSellTrade(state, {
+      symbol: pendingTrade.symbol,
+      amount: pendingTrade.amount,
+      marketPrice: pendingTrade.price,
+      atr,
+      exitReason,
+      fallbackMetadata: {
+        setupScore: pendingTrade.setupScore,
+        marketRegime: pendingTrade.marketRegime,
+        entryReason: pendingTrade.entryReason,
+        indicatorsSnapshot: pendingTrade.indicatorsSnapshot,
+        aiNotes: pendingTrade.aiNotes,
+        strategyVersion: pendingTrade.strategyVersion,
+        stopLoss: pendingTrade.stopLoss,
+        takeProfit: pendingTrade.takeProfit,
+      },
+    });
+  }
+
+  const currentPrice = pendingTrade.price;
+  return recalculatePortfolioValue(nextState, pendingTrade.symbol, currentPrice);
+};
+
+export const syncBotStateWithStrategy = (state: BotState): BotState => {
+  const summary = getStrategySummary();
+  return {
+    ...state,
+    strategyVersion: summary.version,
+    lastRefinementTime: summary.lastRefinementTime,
+    aiWarnings: summary.warnings,
+  };
 };
