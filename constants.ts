@@ -3,7 +3,7 @@ export const TRADING_FEE_RATE = 0.001; // 0.1%
 export const SYMBOLS = ['BTC-USDC', 'ETH-USDC', 'SOL-USDC', 'ZEC-USDC', 'XRP-USDC'];
 
 // Simulation speeds
-export const TICK_INTERVAL_MS = 1000; // 1 second per tick in simulation
+export const TICK_INTERVAL_MS = 60_000; // 1-minute deterministic strategy cycle
 export const RETRAINING_INTERVAL_TICKS = 60; // Retrain every 60 ticks
 
 export const COLORS = {

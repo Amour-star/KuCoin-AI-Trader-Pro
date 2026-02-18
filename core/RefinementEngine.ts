@@ -1,10 +1,19 @@
 import { ActionType, Candle, Trade } from '../types.ts';
 
+export interface StrategyEvaluation {
+  decision: 'BUY' | 'SELL' | 'HOLD';
+  confidence: number;
+  reasons: string[];
+  timestamp: number;
+}
+
 export interface RefinementDecision {
   action: ActionType;
   confidence: number;
   regime: 'TRENDING' | 'RANGING' | 'VOLATILE';
   modelVersion: string;
+  reasons: string[];
+  timestamp: number;
 }
 
 export interface StabilityReport {
@@ -18,17 +27,50 @@ export class RefinementEngine {
   private version = `rf-${Date.now()}`;
   private closedCountByVersion = new Map<string, number>();
 
-  decide(candles: Candle[]): RefinementDecision {
+  evaluate(candles: Candle[]): StrategyEvaluation {
+    const ts = Date.now();
     const last = candles[candles.length - 1];
-    if (!last) return { action: ActionType.HOLD, confidence: 0, regime: 'RANGING', modelVersion: this.version };
+    if (!last) {
+      return {
+        decision: 'HOLD',
+        confidence: 0,
+        reasons: ['No candle data available.'],
+        timestamp: ts,
+      };
+    }
+
     const trend = ((last.emaShort || last.close) - (last.emaLong || last.close)) / Math.max(last.close, 1);
     const vol = (last.atr || 0) / Math.max(last.close, 1);
-    const regime = vol > 0.02 ? 'VOLATILE' : Math.abs(trend) > 0.0015 ? 'TRENDING' : 'RANGING';
     const rawConfidence = clamp(Math.abs(trend) * 350 + ((last.rsi || 50) - 50) / 100, 0, 1);
     const decay = Math.max(0.7, 1 - (this.closedCountByVersion.get(this.version) || 0) * 0.002);
     const confidence = clamp(rawConfidence * decay, 0, 1);
-    const action = trend > 0.0012 ? ActionType.BUY : trend < -0.0012 ? ActionType.SELL : ActionType.HOLD;
-    return { action, confidence, regime, modelVersion: this.version };
+    const decision: StrategyEvaluation['decision'] = trend > 0.0012 ? 'BUY' : trend < -0.0012 ? 'SELL' : 'HOLD';
+
+    const reasons = [
+      `trend=${trend.toFixed(6)}`,
+      `volatility=${vol.toFixed(6)}`,
+      `rsi=${(last.rsi || 50).toFixed(2)}`,
+      decision === 'HOLD' ? 'No directional edge above decision threshold.' : `Directional edge detected for ${decision}.`,
+    ];
+
+    return { decision, confidence, reasons, timestamp: ts };
+  }
+
+  decide(candles: Candle[]): RefinementDecision {
+    const evaluation = this.evaluate(candles);
+    const last = candles[candles.length - 1];
+    const trend = last ? ((last.emaShort || last.close) - (last.emaLong || last.close)) / Math.max(last.close, 1) : 0;
+    const vol = last ? (last.atr || 0) / Math.max(last.close, 1) : 0;
+    const regime = vol > 0.02 ? 'VOLATILE' : Math.abs(trend) > 0.0015 ? 'TRENDING' : 'RANGING';
+
+    return {
+      action: evaluation.decision as ActionType,
+      confidence: evaluation.confidence,
+      regime,
+      modelVersion: this.version,
+      reasons: evaluation.reasons,
+      timestamp: evaluation.timestamp,
+    };
   }
 
   registerClosedTrade(trade: Trade): void {
