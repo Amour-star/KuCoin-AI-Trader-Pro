@@ -35,16 +35,6 @@ const Chart: React.FC<ChartProps> = ({ data, trades }) => {
     };
   });
 
-  const yDomain = React.useMemo<[number, number]>(() => {
-    if (chartData.length === 0) return [0, 1];
-    const lows = chartData.map(candle => candle.low);
-    const highs = chartData.map(candle => candle.high);
-    const min = Math.min(...lows);
-    const max = Math.max(...highs);
-    const range = Math.max(max - min, max * 0.005);
-    const pad = range * 0.06;
-    return [min - pad, max + pad];
-  }, [chartData]);
 
   const CustomTooltip: React.FC<{
     active?: boolean;
@@ -60,7 +50,10 @@ const Chart: React.FC<ChartProps> = ({ data, trades }) => {
           <p className="text-slate-400">H: <span className="text-slate-100">{d.high.toFixed(2)}</span></p>
           <p className="text-slate-400">L: <span className="text-slate-100">{d.low.toFixed(2)}</span></p>
           <p className="text-slate-400">C: <span className="text-slate-100">{d.close.toFixed(2)}</span></p>
-          <p className="text-purple-400 mt-1">RSI: {d.rsi?.toFixed(1)}</p>
+          <p className="text-slate-400 mt-1">V: <span className="text-slate-100">{d.volume.toFixed(4)}</span></p>
+          <p className="text-blue-400">EMA9: {typeof d.emaShort === 'number' ? d.emaShort.toFixed(4) : 'n/a'}</p>
+          <p className="text-purple-400">EMA21: {typeof d.emaLong === 'number' ? d.emaLong.toFixed(4) : 'n/a'}</p>
+          <p className="text-amber-400">RSI: {typeof d.rsi === 'number' ? d.rsi.toFixed(1) : 'n/a'}</p>
         </div>
       );
     }
@@ -92,13 +85,13 @@ const Chart: React.FC<ChartProps> = ({ data, trades }) => {
                 minTickGap={30}
             />
             <YAxis 
-                domain={yDomain}
+                domain={['auto', 'auto']}
                 orientation="right" 
                 stroke="#94a3b8" 
                 tick={{ fontSize: 10 }} 
                 tickLine={false} 
                 axisLine={false}
-                tickFormatter={(val) => val.toFixed(1)}
+                tickFormatter={(val: number) => val.toFixed(4)}
             />
             <Tooltip content={<CustomTooltip />} />
             

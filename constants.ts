@@ -1,6 +1,6 @@
 export const INITIAL_BALANCE = 1000;
 export const TRADING_FEE_RATE = 0.001; // 0.1%
-export const SYMBOLS = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'KCS-USDT', 'XRP-USDT'];
+export const SYMBOLS = ['BTC-USDC', 'ETH-USDC', 'SOL-USDC', 'ZEC-USDC', 'XRP-USDC'];
 
 // Simulation speeds
 export const TICK_INTERVAL_MS = 1000; // 1 second per tick in simulation

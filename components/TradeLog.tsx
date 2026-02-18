@@ -1,11 +1,29 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Trade, ActionType } from '../types';
-import { Download, TrendingUp, TrendingDown, Minus, Filter, X } from 'lucide-react';
+import { Download, Filter, X } from 'lucide-react';
 import { loadTrades, subscribeToTradeStorage } from '../services/storage/tradeStorage';
 
 interface TradeLogProps {
   trades: Trade[];
 }
+
+interface TradeHistoryRow {
+  id: string;
+  time: number;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  entryPrice: number;
+  exitPrice?: number;
+  size: number;
+  fee: number;
+  pnl?: number;
+  pnlPct?: number;
+  confidence?: number;
+  strategyVersion?: string;
+  aiNote?: string;
+}
+
+const round4 = (value: number): number => Number(value.toFixed(4));
 
 const mergeTrades = (propTrades: Trade[], storedTrades: Trade[]): Trade[] => {
   const map = new Map<string, Trade>();
@@ -15,9 +33,57 @@ const mergeTrades = (propTrades: Trade[], storedTrades: Trade[]): Trade[] => {
   return [...map.values()].sort((a, b) => b.timestamp - a.timestamp);
 };
 
+const buildRows = (sourceTrades: Trade[]): TradeHistoryRow[] => {
+  const sorted = [...sourceTrades].sort((a, b) => a.timestamp - b.timestamp);
+  const lastBuyBySymbol = new Map<string, Trade>();
+  const rows: TradeHistoryRow[] = [];
+
+  for (const trade of sorted) {
+    if (trade.type === ActionType.BUY) {
+      lastBuyBySymbol.set(trade.symbol, trade);
+      rows.push({
+        id: trade.id,
+        time: trade.timestamp,
+        symbol: trade.symbol,
+        side: 'BUY',
+        entryPrice: round4(trade.price),
+        size: round4(trade.amount),
+        fee: round4(trade.fee),
+        confidence: trade.setupScore,
+        strategyVersion: trade.strategyVersion,
+        aiNote: trade.aiNotes?.[0],
+      });
+      continue;
+    }
+
+    const entryTrade = lastBuyBySymbol.get(trade.symbol);
+    const entryPrice = entryTrade?.price ?? trade.price;
+    const pnl = typeof trade.pnl === 'number' ? trade.pnl : undefined;
+    const pnlPct = pnl !== undefined && entryPrice > 0 && trade.amount > 0 ? (pnl / (entryPrice * trade.amount)) * 100 : undefined;
+
+    rows.push({
+      id: trade.id,
+      time: trade.timestamp,
+      symbol: trade.symbol,
+      side: 'SELL',
+      entryPrice: round4(entryPrice),
+      exitPrice: round4(trade.price),
+      size: round4(trade.amount),
+      fee: round4(trade.fee),
+      pnl: pnl !== undefined ? round4(pnl) : undefined,
+      pnlPct: pnlPct !== undefined ? round4(pnlPct) : undefined,
+      confidence: trade.setupScore,
+      strategyVersion: trade.strategyVersion,
+      aiNote: trade.aiNotes?.[0],
+    });
+  }
+
+  return rows.sort((a, b) => b.time - a.time);
+};
+
 const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
   const [isFilterOpen, setIsFilterOpen] = useState(false);
-  const [typeFilter, setTypeFilter] = useState<string>('ALL');
+  const [sideFilter, setSideFilter] = useState<string>('ALL');
   const [symbolFilter, setSymbolFilter] = useState<string>('ALL');
   const [startDate, setStartDate] = useState<string>('');
   const [endDate, setEndDate] = useState<string>('');
@@ -31,90 +97,70 @@ const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
   }, []);
 
   const sourceTrades = useMemo(() => mergeTrades(trades, storedTrades), [trades, storedTrades]);
+  const historyRows = useMemo(() => buildRows(sourceTrades), [sourceTrades]);
 
   const uniqueSymbols = useMemo(() => {
-    const symbols = new Set(sourceTrades.map(trade => trade.symbol));
+    const symbols = new Set(historyRows.map(row => row.symbol));
     return Array.from(symbols).sort();
-  }, [sourceTrades]);
+  }, [historyRows]);
 
-  const filteredTrades = useMemo(() => {
-    return sourceTrades.filter(trade => {
-      if (typeFilter !== 'ALL' && trade.type !== typeFilter) return false;
-      if (symbolFilter !== 'ALL' && trade.symbol !== symbolFilter) return false;
+  const filteredRows = useMemo(() => {
+    return historyRows.filter(row => {
+      if (sideFilter !== 'ALL' && row.side !== sideFilter) return false;
+      if (symbolFilter !== 'ALL' && row.symbol !== symbolFilter) return false;
       if (startDate) {
         const startTimestamp = new Date(startDate).setHours(0, 0, 0, 0);
-        if (trade.timestamp < startTimestamp) return false;
+        if (row.time < startTimestamp) return false;
       }
       if (endDate) {
         const endTimestamp = new Date(endDate).setHours(23, 59, 59, 999);
-        if (trade.timestamp > endTimestamp) return false;
+        if (row.time > endTimestamp) return false;
       }
       return true;
     });
-  }, [sourceTrades, typeFilter, symbolFilter, startDate, endDate]);
+  }, [historyRows, sideFilter, symbolFilter, startDate, endDate]);
 
   const downloadCSV = () => {
-    const headers = [
-      'ID',
-      'Symbol',
-      'Type',
-      'Price',
-      'Amount',
-      'Setup Score',
-      'Market Regime',
-      'Entry Reason',
-      'AI Notes',
-      'Stop Loss',
-      'Take Profit',
-      'Exit Reason',
-      'R Multiple',
-      'Fee',
-      'Time',
-      'PnL',
-    ];
-    const rows = filteredTrades.map(trade => [
-      trade.id,
-      trade.symbol,
-      trade.type,
-      trade.price,
-      trade.amount,
-      trade.setupScore?.toFixed(3) || '',
-      trade.marketRegime || '',
-      trade.entryReason || '',
-      (trade.aiNotes || []).join(' | '),
-      trade.stopLoss ? trade.stopLoss.toFixed(2) : '',
-      trade.takeProfit ? trade.takeProfit.toFixed(2) : '',
-      trade.exitReason || '',
-      trade.rMultiple?.toFixed(3) || '',
-      trade.fee,
-      new Date(trade.timestamp).toISOString(),
-      trade.pnl ? trade.pnl.toFixed(4) : '',
+    const headers = ['Time', 'Symbol', 'Side', 'Entry Price', 'Exit Price', 'Size', 'Fee', 'PnL', 'PnL %', 'Confidence Score', 'Strategy Version', 'AI Notes'];
+    const rows = filteredRows.map(row => [
+      new Date(row.time).toISOString(),
+      row.symbol,
+      row.side,
+      row.entryPrice,
+      row.exitPrice ?? '',
+      row.size,
+      row.fee,
+      row.pnl ?? '',
+      row.pnlPct ?? '',
+      typeof row.confidence === 'number' ? row.confidence.toFixed(4) : '',
+      row.strategyVersion ?? '',
+      row.aiNote ?? '',
     ]);
 
     const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(row => row.join(','))].join('\n');
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
-    link.setAttribute('download', 'kucoin_bot_trades.csv');
+    link.setAttribute('download', 'trade_history_usdc.csv');
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
 
   const clearFilters = () => {
-    setTypeFilter('ALL');
+    setSideFilter('ALL');
     setSymbolFilter('ALL');
     setStartDate('');
     setEndDate('');
   };
 
-  const hasActiveFilters = typeFilter !== 'ALL' || symbolFilter !== 'ALL' || startDate !== '' || endDate !== '';
+  const hasActiveFilters = sideFilter !== 'ALL' || symbolFilter !== 'ALL' || startDate !== '' || endDate !== '';
 
   return (
     <div className="bg-slate-900 rounded-lg border border-slate-800 flex flex-col h-full">
       <div className="p-4 border-b border-slate-800 flex justify-between items-center shrink-0">
         <h3 className="text-slate-300 font-semibold flex items-center gap-2">
-          Trade History <span className="text-slate-500 text-xs font-normal">({filteredTrades.length})</span>
+          Trade History <span className="text-slate-500 text-xs font-normal">({filteredRows.length})</span>
         </h3>
         <div className="flex gap-2">
           <button
@@ -137,15 +183,15 @@ const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
       </div>
 
       {isFilterOpen && (
-        <div className="p-3 bg-slate-950/50 border-b border-slate-800 grid grid-cols-2 md:grid-cols-4 gap-3 animate-in slide-in-from-top-2 duration-200">
+        <div className="p-3 bg-slate-950/50 border-b border-slate-800 grid grid-cols-2 md:grid-cols-4 gap-3">
           <div>
-            <label className="text-[10px] text-slate-500 uppercase font-bold block mb-1">Type</label>
+            <label className="text-[10px] text-slate-500 uppercase font-bold block mb-1">Side</label>
             <select
-              value={typeFilter}
-              onChange={event => setTypeFilter(event.target.value)}
-              className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5 focus:outline-none focus:border-blue-500"
+              value={sideFilter}
+              onChange={event => setSideFilter(event.target.value)}
+              className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5"
             >
-              <option value="ALL">All Types</option>
+              <option value="ALL">All</option>
               <option value={ActionType.BUY}>Buy</option>
               <option value={ActionType.SELL}>Sell</option>
             </select>
@@ -155,40 +201,24 @@ const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
             <select
               value={symbolFilter}
               onChange={event => setSymbolFilter(event.target.value)}
-              className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5 focus:outline-none focus:border-blue-500"
+              className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5"
             >
               <option value="ALL">All Symbols</option>
               {uniqueSymbols.map(symbol => (
-                <option key={symbol} value={symbol}>
-                  {symbol}
-                </option>
+                <option key={symbol} value={symbol}>{symbol}</option>
               ))}
             </select>
           </div>
           <div>
             <label className="text-[10px] text-slate-500 uppercase font-bold block mb-1">From</label>
-            <input
-              type="date"
-              value={startDate}
-              onChange={event => setStartDate(event.target.value)}
-              className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5 focus:outline-none focus:border-blue-500 [color-scheme:dark]"
-            />
+            <input type="date" value={startDate} onChange={event => setStartDate(event.target.value)} className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5 [color-scheme:dark]" />
           </div>
           <div>
             <label className="text-[10px] text-slate-500 uppercase font-bold block mb-1">To</label>
-            <input
-              type="date"
-              value={endDate}
-              onChange={event => setEndDate(event.target.value)}
-              className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5 focus:outline-none focus:border-blue-500 [color-scheme:dark]"
-            />
+            <input type="date" value={endDate} onChange={event => setEndDate(event.target.value)} className="w-full bg-slate-800 text-xs text-slate-200 border border-slate-700 rounded p-1.5 [color-scheme:dark]" />
           </div>
-
           {hasActiveFilters && (
-            <button
-              onClick={clearFilters}
-              className="col-span-2 md:col-span-4 text-xs text-red-400 hover:text-red-300 flex items-center justify-center gap-1 mt-1 py-1"
-            >
+            <button onClick={clearFilters} className="col-span-2 md:col-span-4 text-xs text-red-400 hover:text-red-300 flex items-center justify-center gap-1 mt-1 py-1">
               <X size={12} /> Clear Active Filters
             </button>
           )}
@@ -197,62 +227,37 @@ const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
 
       <div className="flex-1 overflow-auto p-2 min-h-0">
         <table className="w-full text-left text-xs text-slate-400">
-          <thead className="text-slate-500 font-medium sticky top-0 bg-slate-900 z-10 shadow-sm">
+          <thead className="text-slate-500 font-medium sticky top-0 bg-slate-900 z-10">
             <tr>
-              <th className="pb-2 pl-2 bg-slate-900">Time</th>
-              <th className="pb-2 bg-slate-900">Type</th>
-              <th className="pb-2 text-right bg-slate-900">Price</th>
-              <th className="pb-2 text-right bg-slate-900">Amount</th>
-              <th className="pb-2 text-right bg-slate-900">Score</th>
-              <th className="pb-2 text-right bg-slate-900">Regime</th>
-              <th className="pb-2 text-right bg-slate-900">AI Note</th>
-              <th className="pb-2 text-right bg-slate-900 text-red-400/70">SL</th>
-              <th className="pb-2 text-right bg-slate-900 text-emerald-400/70">TP</th>
-              <th className="pb-2 text-right bg-slate-900">Exit</th>
-              <th className="pb-2 text-right bg-slate-900">R</th>
-              <th className="pb-2 text-right bg-slate-900">Fee</th>
-              <th className="pb-2 text-right pr-2 bg-slate-900">PnL</th>
+              <th className="pb-2 pl-2">Time</th><th className="pb-2">Symbol</th><th className="pb-2">Side</th>
+              <th className="pb-2 text-right">Entry Price</th><th className="pb-2 text-right">Exit Price</th><th className="pb-2 text-right">Size</th>
+              <th className="pb-2 text-right">Fee</th><th className="pb-2 text-right">PnL</th><th className="pb-2 text-right">PnL %</th>
+              <th className="pb-2 text-right">Confidence</th><th className="pb-2 text-right">Strategy</th><th className="pb-2 text-right pr-2">Notes</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-800/50">
-            {filteredTrades.map(trade => (
-              <tr key={trade.id} className="hover:bg-slate-800/50 transition">
-                <td className="py-2 pl-2 font-mono text-slate-500 whitespace-nowrap">{new Date(trade.timestamp).toLocaleTimeString()}</td>
-                <td className="py-2">
-                  <span className={`flex items-center gap-1 font-bold ${trade.type === ActionType.BUY ? 'text-emerald-500' : 'text-red-500'}`}>
-                    {trade.type === ActionType.BUY ? <TrendingUp size={12} /> : <TrendingDown size={12} />}
-                    {trade.type}
-                  </span>
+            {filteredRows.map(row => (
+              <tr key={row.id} className="hover:bg-slate-800/40">
+                <td className="py-2 pl-2 font-mono whitespace-nowrap">{new Date(row.time).toLocaleString()}</td>
+                <td className="py-2 font-mono text-slate-200">{row.symbol}</td>
+                <td className={`py-2 font-bold ${row.side === 'BUY' ? 'text-emerald-400' : 'text-red-400'}`}>{row.side}</td>
+                <td className="py-2 text-right font-mono">{row.entryPrice.toFixed(4)}</td>
+                <td className="py-2 text-right font-mono">{typeof row.exitPrice === 'number' ? row.exitPrice.toFixed(4) : '-'}</td>
+                <td className="py-2 text-right font-mono">{row.size.toFixed(4)}</td>
+                <td className="py-2 text-right font-mono text-amber-300">{row.fee.toFixed(4)}</td>
+                <td className={`py-2 text-right font-mono ${typeof row.pnl === 'number' ? (row.pnl >= 0 ? 'text-emerald-400' : 'text-red-400') : 'text-slate-500'}`}>
+                  {typeof row.pnl === 'number' ? row.pnl.toFixed(4) : '-'}
                 </td>
-                <td className="py-2 text-right font-mono text-slate-200">{trade.price.toFixed(2)}</td>
-                <td className="py-2 text-right font-mono">{trade.amount.toFixed(4)}</td>
-                <td className="py-2 text-right font-mono text-blue-300">{typeof trade.setupScore === 'number' ? trade.setupScore.toFixed(2) : '-'}</td>
-                <td className="py-2 text-right font-mono text-amber-300">{trade.marketRegime || '-'}</td>
-                <td className="py-2 text-right font-mono text-slate-500 max-w-[180px] truncate">
-                  {trade.aiNotes && trade.aiNotes.length > 0 ? trade.aiNotes[0] : '-'}
+                <td className={`py-2 text-right font-mono ${typeof row.pnlPct === 'number' ? (row.pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400') : 'text-slate-500'}`}>
+                  {typeof row.pnlPct === 'number' ? `${row.pnlPct.toFixed(4)}%` : '-'}
                 </td>
-                <td className="py-2 text-right font-mono text-slate-500">{trade.stopLoss ? trade.stopLoss.toFixed(2) : '-'}</td>
-                <td className="py-2 text-right font-mono text-slate-500">{trade.takeProfit ? trade.takeProfit.toFixed(2) : '-'}</td>
-                <td className="py-2 text-right font-mono text-slate-500">{trade.exitReason || '-'}</td>
-                <td className="py-2 text-right font-mono text-slate-500">{typeof trade.rMultiple === 'number' ? trade.rMultiple.toFixed(2) : '-'}</td>
-                <td className="py-2 text-right font-mono text-slate-500">{trade.fee.toFixed(4)}</td>
-                <td className="py-2 text-right pr-2 font-mono">
-                  {trade.type === ActionType.SELL ? (
-                    <span className={trade.pnl && trade.pnl > 0 ? 'text-emerald-400' : 'text-red-400'}>
-                      {trade.pnl ? (trade.pnl > 0 ? '+' : '') + trade.pnl.toFixed(2) : '0.00'}
-                    </span>
-                  ) : (
-                    <Minus size={12} className="ml-auto text-slate-600" />
-                  )}
-                </td>
+                <td className="py-2 text-right font-mono text-blue-300">{typeof row.confidence === 'number' ? row.confidence.toFixed(4) : '-'}</td>
+                <td className="py-2 text-right font-mono">{row.strategyVersion ?? '-'}</td>
+                <td className="py-2 text-right pr-2 max-w-[220px] truncate" title={row.aiNote || ''}>{row.aiNote || '-'}</td>
               </tr>
             ))}
-            {filteredTrades.length === 0 && (
-              <tr>
-                <td colSpan={13} className="text-center py-8 text-slate-600 italic">
-                  {sourceTrades.length === 0 ? 'No trades recorded yet. Start the bot.' : 'No trades match the current filters.'}
-                </td>
-              </tr>
+            {filteredRows.length === 0 && (
+              <tr><td colSpan={12} className="text-center py-8 text-slate-600 italic">No persisted trade history entries.</td></tr>
             )}
           </tbody>
         </table>

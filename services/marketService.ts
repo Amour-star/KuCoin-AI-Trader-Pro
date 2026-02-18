@@ -1,4 +1,5 @@
 import { Candle, MarketData, ConnectivityStatus } from '../types';
+import { SYMBOLS } from '../constants';
 
 let currentConnectivity: ConnectivityStatus = 'CONNECTING';
 
@@ -8,32 +9,33 @@ const lastKnownPrices: Record<string, number> = {};
 const lastKnownVolumes: Record<string, number> = {};
 const lastKnownChanges: Record<string, number> = {};
 
-export const mockMarketData: MarketData[] = [
-  { symbol: 'BTC-USDT', price: 64230.5, volume24h: 1542000000, change24h: 2.4 },
-  { symbol: 'ETH-USDT', price: 3450.12, volume24h: 840000000, change24h: -1.2 },
-  { symbol: 'SOL-USDT', price: 145.6, volume24h: 320000000, change24h: 5.7 },
-  { symbol: 'BNB-USDT', price: 602.34, volume24h: 710000000, change24h: 1.1 },
-  { symbol: 'XRP-USDT', price: 0.62, volume24h: 210000000, change24h: 1.1 },
-];
-
-for (const m of mockMarketData) {
-  lastKnownPrices[m.symbol] = m.price;
-  lastKnownVolumes[m.symbol] = m.volume24h;
-  lastKnownChanges[m.symbol] = m.change24h;
-}
-
 const BINANCE_API = 'https://api.binance.com';
+const MIN_CANDLES_FOR_INDICATORS = 50;
+const SUPPORTED_SYMBOLS_CACHE_TTL_MS = 10 * 60 * 1000;
 
-const asNumber = (value: unknown, fallback: number = 0): number => {
+type NormalizedKline = {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+type KlineRow = [number, string, string, string, string, string, number, string, number, string, string, string];
+
+let supportedSymbolsCache: { fetchedAt: number; symbols: Set<string> } | null = null;
+
+const asNumber = (value: unknown): number => {
   const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
+  return Number.isFinite(n) ? n : Number.NaN;
 };
 
 const toBinanceSymbol = (symbol: string): string => symbol.replace('-', '').toUpperCase();
-const fromBinanceSymbol = (symbol: string): string => symbol.endsWith('USDT') ? `${symbol.slice(0, -4)}-USDT` : symbol;
+const fromBinanceSymbol = (symbol: string): string => (symbol.endsWith('USDC') ? `${symbol.slice(0, -4)}-USDC` : symbol);
 
-const isHotTradableUsdtSpot = (binanceSymbol: string): boolean => {
-  if (!binanceSymbol.endsWith('USDT')) return false;
+const isHotTradableUsdcSpot = (binanceSymbol: string): boolean => {
+  if (!binanceSymbol.endsWith('USDC')) return false;
   const base = binanceSymbol.slice(0, -4);
   const blockedSuffixes = ['UP', 'DOWN', 'BULL', 'BEAR', '1000'];
   return base.length > 1 && !blockedSuffixes.some(sfx => base.endsWith(sfx));
@@ -67,83 +69,168 @@ const fetchBinanceJson = async <T>(path: string, params?: Record<string, string 
   return (await res.json()) as T;
 };
 
-const calculateIndicators = (candles: Candle[]): Candle[] => {
-  const emaShortPeriod = 9;
-  const emaLongPeriod = 21;
-  const rsiPeriod = 14;
+const calculateEmaSeries = (values: number[], period: number): Array<number | undefined> => {
+  const multiplier = 2 / (period + 1);
+  const out: Array<number | undefined> = new Array(values.length).fill(undefined);
+  if (values.length < period) return out;
 
-  const result = candles.map(c => ({ ...c }));
-
-  for (let i = 0; i < result.length; i++) {
-    if (i >= emaShortPeriod - 1) {
-      const slice = result.slice(i - emaShortPeriod + 1, i + 1);
-      const sum = slice.reduce((acc, val) => acc + val.close, 0);
-      result[i].emaShort = sum / emaShortPeriod;
-    }
-    if (i >= emaLongPeriod - 1) {
-      const slice = result.slice(i - emaLongPeriod + 1, i + 1);
-      const sum = slice.reduce((acc, val) => acc + val.close, 0);
-      result[i].emaLong = sum / emaLongPeriod;
-    }
+  let ema = values.slice(0, period).reduce((sum, v) => sum + v, 0) / period;
+  out[period - 1] = ema;
+  for (let i = period; i < values.length; i += 1) {
+    ema = (values[i] - ema) * multiplier + ema;
+    out[i] = ema;
   }
+  return out;
+};
+
+const calculateRsiSeries = (values: number[], period: number): Array<number | undefined> => {
+  const out: Array<number | undefined> = new Array(values.length).fill(undefined);
+  if (values.length <= period) return out;
 
   let gains = 0;
   let losses = 0;
-  for (let i = 1; i <= rsiPeriod; i++) {
-    if (i < result.length) {
-      const diff = result[i].close - result[i - 1].close;
-      if (diff > 0) gains += diff;
-      else losses -= diff;
-    }
+  for (let i = 1; i <= period; i += 1) {
+    const delta = values[i] - values[i - 1];
+    if (delta >= 0) gains += delta;
+    else losses -= delta;
   }
 
-  if (result.length > rsiPeriod) {
-    let avgGain = gains / rsiPeriod;
-    let avgLoss = losses / rsiPeriod;
-    for (let i = rsiPeriod + 1; i < result.length; i++) {
-      const diff = result[i].close - result[i - 1].close;
-      const currentGain = diff > 0 ? diff : 0;
-      const currentLoss = diff < 0 ? -diff : 0;
-      avgGain = (avgGain * (rsiPeriod - 1) + currentGain) / rsiPeriod;
-      avgLoss = (avgLoss * (rsiPeriod - 1) + currentLoss) / rsiPeriod;
-      const rs = avgGain / (avgLoss || 1);
-      result[i].rsi = 100 - 100 / (1 + rs);
-    }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+
+  for (let i = period + 1; i < values.length; i += 1) {
+    const delta = values[i] - values[i - 1];
+    const gain = delta > 0 ? delta : 0;
+    const loss = delta < 0 ? -delta : 0;
+    avgGain = ((avgGain * (period - 1)) + gain) / period;
+    avgLoss = ((avgLoss * (period - 1)) + loss) / period;
+    const rs = avgGain / (avgLoss || 1e-8);
+    out[i] = 100 - (100 / (1 + rs));
   }
 
-  return result;
+  return out;
 };
 
-const generateFallbackCandles = (symbol: string, count: number = 100): Candle[] => {
-  const known = lastKnownPrices[symbol] || mockMarketData.find(m => m.symbol === symbol)?.price || 1000;
+const calculateAtrSeries = (candles: Candle[], period: number): Array<number | undefined> => {
+  const out: Array<number | undefined> = new Array(candles.length).fill(undefined);
+  if (candles.length < period + 1) return out;
+  const trs: number[] = [];
+
+  for (let i = 1; i < candles.length; i += 1) {
+    const current = candles[i];
+    const prev = candles[i - 1];
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(current.high - prev.close),
+      Math.abs(current.low - prev.close),
+    );
+    trs.push(tr);
+  }
+
+  for (let i = period; i < trs.length; i += 1) {
+    const window = trs.slice(i - period, i);
+    out[i + 1] = window.reduce((sum, v) => sum + v, 0) / period;
+  }
+
+  return out;
+};
+
+const calculateIndicators = (candles: Candle[]): Candle[] => {
+  if (candles.length < MIN_CANDLES_FOR_INDICATORS) {
+    console.warn(`[market-data] ${candles[0]?.time ?? 'n/a'} insufficient candles (${candles.length}) for indicators; need ${MIN_CANDLES_FOR_INDICATORS}.`);
+    return candles;
+  }
+
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const emaShort = calculateEmaSeries(closes, 9);
+  const emaLong = calculateEmaSeries(closes, 21);
+  const ema12 = calculateEmaSeries(closes, 12);
+  const ema26 = calculateEmaSeries(closes, 26);
+  const rsi = calculateRsiSeries(closes, 14);
+  const atr = calculateAtrSeries(candles, 14);
+
+  const macdLine = closes.map((_, idx) => {
+    const fast = ema12[idx];
+    const slow = ema26[idx];
+    return typeof fast === 'number' && typeof slow === 'number' ? fast - slow : undefined;
+  });
+  const macdSignal = calculateEmaSeries(macdLine.map(v => v ?? 0), 9);
+
+  return candles.map((candle, idx) => {
+    const volumeSma20 = idx >= 19 ? volumes.slice(idx - 19, idx + 1).reduce((sum, v) => sum + v, 0) / 20 : undefined;
+    return {
+      ...candle,
+      emaShort: emaShort[idx],
+      emaLong: emaLong[idx],
+      rsi: rsi[idx],
+      atr: atr[idx],
+      macd: macdLine[idx],
+      macdSignal: macdSignal[idx],
+      macdHistogram: typeof macdLine[idx] === 'number' && typeof macdSignal[idx] === 'number' ? macdLine[idx]! - macdSignal[idx]! : undefined,
+      volumeSma20,
+      volumeRatio: typeof volumeSma20 === 'number' && volumeSma20 > 0 ? candle.volume / volumeSma20 : undefined,
+    };
+  });
+};
+
+const getSupportedSymbols = async (): Promise<Set<string>> => {
   const now = Date.now();
-  const candles: Candle[] = [];
-
-  let tempPrice = known;
-  const history: number[] = [tempPrice];
-  for (let i = 0; i < count - 1; i++) {
-    tempPrice = tempPrice / (1 + (Math.random() - 0.5) * 0.01);
-    history.unshift(tempPrice);
+  if (supportedSymbolsCache && (now - supportedSymbolsCache.fetchedAt < SUPPORTED_SYMBOLS_CACHE_TTL_MS)) {
+    return supportedSymbolsCache.symbols;
   }
 
-  for (let i = 0; i < count; i++) {
-    const time = now - (count - 1 - i) * 60 * 60 * 1000;
-    const close = history[i];
-    const open = i > 0 ? history[i - 1] : close;
-    const high = Math.max(open, close) * (1 + Math.random() * 0.004);
-    const low = Math.min(open, close) * (1 - Math.random() * 0.004);
-    candles.push({
-      timestamp: time,
-      time: new Date(time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      open,
-      high,
-      low,
-      close,
-      volume: Math.random() * 5000 + 1000,
-    });
+  interface ExchangeInfoResponse { symbols: Array<{ symbol: string; status: string; isSpotTradingAllowed: boolean }>; }
+  const exchangeInfo = await fetchBinanceJson<ExchangeInfoResponse>('/api/v3/exchangeInfo');
+  const symbols = new Set(
+    exchangeInfo.symbols
+      .filter(item => item.status === 'TRADING' && item.isSpotTradingAllowed)
+      .map(item => item.symbol.toUpperCase()),
+  );
+
+  supportedSymbolsCache = { fetchedAt: now, symbols };
+  return symbols;
+};
+
+const ensureSupportedUsdcPair = async (symbol: string): Promise<void> => {
+  const binanceSymbol = toBinanceSymbol(symbol);
+  const supported = await getSupportedSymbols();
+  if (!supported.has(binanceSymbol)) {
+    const message = `[market-data] Binance Spot does not support pair ${binanceSymbol}`;
+    console.error(message);
+    throw new Error(message);
+  }
+};
+
+export const getKlines = async (symbol: string, interval: string = '1h', limit: number = 100): Promise<NormalizedKline[]> => {
+  await ensureSupportedUsdcPair(symbol);
+  const rows = await fetchBinanceJson<KlineRow[]>('/api/v3/klines', {
+    symbol: toBinanceSymbol(symbol),
+    interval,
+    limit,
+  });
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error(`[market-data] Empty kline payload for ${symbol}`);
   }
 
-  return calculateIndicators(candles);
+  const normalized = rows
+    .map((row) => ({
+      time: asNumber(row[0]),
+      open: asNumber(row[1]),
+      high: asNumber(row[2]),
+      low: asNumber(row[3]),
+      close: asNumber(row[4]),
+      volume: asNumber(row[5]),
+    }))
+    .filter((row) => [row.time, row.open, row.high, row.low, row.close, row.volume].every(Number.isFinite));
+
+  if (normalized.length === 0) {
+    throw new Error(`[market-data] All kline rows invalid for ${symbol}`);
+  }
+
+  console.info(`[market-data] ${symbol} last close=${normalized[normalized.length - 1].close}`);
+  return normalized;
 };
 
 export const fetchTopCoins = async (): Promise<MarketData[]> => {
@@ -157,7 +244,7 @@ export const fetchTopCoins = async (): Promise<MarketData[]> => {
 
     const tickers = await fetchBinanceJson<BinanceTicker24h[]>('/api/v3/ticker/24hr');
     const sorted = tickers
-      .filter(ticker => isHotTradableUsdtSpot(ticker.symbol))
+      .filter(ticker => isHotTradableUsdcSpot(ticker.symbol))
       .map(ticker => {
         const symbol = fromBinanceSymbol(ticker.symbol);
         const price = asNumber(ticker.lastPrice);
@@ -165,11 +252,9 @@ export const fetchTopCoins = async (): Promise<MarketData[]> => {
         const change24h = asNumber(ticker.priceChangePercent);
         return { symbol, price, volume24h, change24h };
       })
-      .filter(t => t.price > 0 && t.volume24h > 0)
+      .filter(t => Number.isFinite(t.price) && t.price > 0 && Number.isFinite(t.volume24h) && t.volume24h > 0)
       .sort((a, b) => b.volume24h - a.volume24h)
       .slice(0, 10);
-
-    if (sorted.length === 0) throw new Error('No Binance top coins found');
 
     for (const t of sorted) {
       lastKnownPrices[t.symbol] = t.price;
@@ -177,59 +262,45 @@ export const fetchTopCoins = async (): Promise<MarketData[]> => {
       lastKnownChanges[t.symbol] = t.change24h;
     }
 
-    currentConnectivity = 'REALTIME';
-    return sorted;
-  } catch {
+    currentConnectivity = sorted.length > 0 ? 'REALTIME' : 'SIMULATED';
+    return sorted.length > 0 ? sorted : SYMBOLS.map(symbol => ({ symbol, price: lastKnownPrices[symbol] || 0, volume24h: 0, change24h: 0 }));
+  } catch (error) {
+    console.error('[market-data] Failed to fetch top USDC coins', error);
     currentConnectivity = 'SIMULATED';
-    return mockMarketData;
+    return SYMBOLS.map(symbol => ({ symbol, price: lastKnownPrices[symbol] || 0, volume24h: 0, change24h: 0 }));
   }
 };
 
 export const fetchCandles = async (symbol: string): Promise<Candle[]> => {
   try {
-    type KlineRow = [number, string, string, string, string, string, number, string, number, string, string, string];
+    const rows = await getKlines(symbol, '1h', 200);
 
-    const rows = await fetchBinanceJson<KlineRow[]>('/api/v3/klines', {
-      symbol: toBinanceSymbol(symbol),
-      interval: '1h',
-      limit: 100,
-    });
+    const candles: Candle[] = rows.map((row) => ({
+      timestamp: row.time,
+      time: new Date(row.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      open: row.open,
+      high: row.high,
+      low: row.low,
+      close: row.close,
+      volume: row.volume,
+    }));
 
-    if (!Array.isArray(rows) || rows.length === 0) throw new Error('Empty kline data');
-
-    const candles: Candle[] = rows
-      .map(row => {
-        const ts = asNumber(row[0]);
-        const open = asNumber(row[1]);
-        const high = asNumber(row[2]);
-        const low = asNumber(row[3]);
-        const close = asNumber(row[4]);
-        const volume = asNumber(row[5]);
-        return {
-          timestamp: ts,
-          time: new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          open,
-          high,
-          low,
-          close,
-          volume,
-        };
-      })
-      .filter(c => c.timestamp > 0 && c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0);
-
-    if (candles.length === 0) throw new Error('Invalid kline payload');
+    if (candles.length === 0) throw new Error(`[market-data] No candles parsed for ${symbol}`);
 
     lastKnownPrices[symbol] = candles[candles.length - 1].close;
     currentConnectivity = 'REALTIME';
     return calculateIndicators(candles);
-  } catch {
+  } catch (error) {
+    console.error(`[market-data] fetchCandles failed for ${symbol}`, error);
     currentConnectivity = 'SIMULATED';
-    return generateFallbackCandles(symbol);
+    return [];
   }
 };
 
 export const fetchLatestTicker = async (symbol: string): Promise<MarketData | null> => {
   try {
+    await ensureSupportedUsdcPair(symbol);
+
     interface BinanceTicker24hSingle {
       symbol: string;
       lastPrice: string;
@@ -241,26 +312,21 @@ export const fetchLatestTicker = async (symbol: string): Promise<MarketData | nu
       symbol: toBinanceSymbol(symbol),
     });
 
-    const price = asNumber(ticker.lastPrice, lastKnownPrices[symbol] || 0);
-    const volume24h = asNumber(ticker.quoteVolume, lastKnownVolumes[symbol] || 0);
-    const change24h = asNumber(ticker.priceChangePercent, lastKnownChanges[symbol] || 0);
+    const price = asNumber(ticker.lastPrice);
+    const volume24h = asNumber(ticker.quoteVolume);
+    const change24h = asNumber(ticker.priceChangePercent);
 
-    if (!(price > 0)) throw new Error('Invalid latest price');
+    if (!(Number.isFinite(price) && price > 0)) throw new Error('Invalid latest price');
 
     lastKnownPrices[symbol] = price;
-    lastKnownVolumes[symbol] = volume24h;
-    lastKnownChanges[symbol] = change24h;
+    lastKnownVolumes[symbol] = Number.isFinite(volume24h) ? volume24h : lastKnownVolumes[symbol] || 0;
+    lastKnownChanges[symbol] = Number.isFinite(change24h) ? change24h : lastKnownChanges[symbol] || 0;
     currentConnectivity = 'REALTIME';
 
-    return { symbol, price, volume24h, change24h };
-  } catch {
+    return { symbol, price, volume24h: lastKnownVolumes[symbol] || 0, change24h: lastKnownChanges[symbol] || 0 };
+  } catch (error) {
+    console.error(`[market-data] fetchLatestTicker failed for ${symbol}`, error);
     currentConnectivity = 'SIMULATED';
-    const fallback = lastKnownPrices[symbol] || mockMarketData.find(m => m.symbol === symbol)?.price || 100;
-    return {
-      symbol,
-      price: fallback,
-      volume24h: lastKnownVolumes[symbol] || 1000000,
-      change24h: lastKnownChanges[symbol] || 0,
-    };
+    return null;
   }
 };

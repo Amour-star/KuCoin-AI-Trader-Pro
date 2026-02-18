@@ -85,6 +85,12 @@ export interface Candle {
   rsi?: number;
   emaShort?: number;
   emaLong?: number;
+  atr?: number;
+  macd?: number;
+  macdSignal?: number;
+  macdHistogram?: number;
+  volumeSma20?: number;
+  volumeRatio?: number;
 }
 
 export interface Trade {
@@ -146,7 +152,7 @@ export interface BotState {
   isRunning: boolean;
   autoPaperTrading: boolean;
   connectivity: ConnectivityStatus;
-  balance: number; // USDT
+  balance: number; // USDC
   holdings: Record<string, number>; // Symbol -> Amount
   averageEntryPrices: Record<string, number>; // Symbol -> Avg Entry Price (Cost Basis)
   activePositions: Position[]; // Track individual open positions for SL/TP
@@ -197,8 +203,8 @@ export interface PendingTrade {
   action: ActionType;
   price: number;
   amount: number;      // Amount of crypto
-  totalValue: number;  // Total USDT value involved
-  fee: number;         // Estimated fee in USDT
+  totalValue: number;  // Total USDC value involved
+  fee: number;         // Estimated fee in USDC
   stopLoss?: number;
   takeProfit?: number;
   marketRegime?: MarketRegime;
