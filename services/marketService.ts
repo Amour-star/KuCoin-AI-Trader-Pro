@@ -25,7 +25,8 @@ for (const m of mockMarketData) {
 type KucoinBase = 'dev-proxy' | 'direct' | 'cors-proxy';
 
 const KUCOIN_ORIGIN = 'https://api.kucoin.com';
-const useDevProxy = import.meta.env.VITE_USE_KUCOIN_DEV_PROXY === 'true';
+const env = ((import.meta as unknown as { env?: Record<string, string> })?.env) || {};
+const useDevProxy = env.VITE_USE_KUCOIN_DEV_PROXY === 'true';
 const KUCOIN_BASES: KucoinBase[] = useDevProxy
   ? ['dev-proxy', 'direct', 'cors-proxy']
   : ['direct', 'cors-proxy'];
@@ -52,7 +53,7 @@ const buildKucoinUrl = (
 
 const fetchWithTimeout = async (url: string, timeoutMs: number = 12000): Promise<Response> => {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, {
       method: 'GET',
@@ -60,7 +61,7 @@ const fetchWithTimeout = async (url: string, timeoutMs: number = 12000): Promise
       signal: controller.signal,
     });
   } finally {
-    window.clearTimeout(timeout);
+    globalThis.clearTimeout(timeout);
   }
 };
 
