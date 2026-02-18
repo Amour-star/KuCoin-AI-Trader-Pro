@@ -20,6 +20,8 @@ import { coreEventBus } from './core/EventBus';
 import PerformanceDashboard from './components/PerformanceDashboard';
 import InstitutionalDashboard from './dashboard/InstitutionalDashboard';
 import { LatencyArbitrageDetector } from './latency/LatencyArbitrageDetector';
+import ManualTradePanel from './components/ManualTradePanel';
+import { getBackendStatus, getBackendTrades } from './services/backendApi';
 
 const BOT_STATE_STORAGE_KEY = 'kucoin-paper-bot-state-v2';
 const createInitialBotState = (): BotState => {
@@ -93,6 +95,8 @@ const App: React.FC = () => {
   const [exposureBySymbol, setExposureBySymbol] = useState<Record<string, number>>({});
   const [latencyHeatmap, setLatencyHeatmap] = useState<Record<string, number>>({});
   const [strategyCounters, setStrategyCounters] = useState({ totalEvaluations: 0, totalSignals: 0, totalTradesExecuted: 0 });
+  const [backendHeartbeat, setBackendHeartbeat] = useState<string>('N/A');
+  const [backendConnected, setBackendConnected] = useState(false);
 
   const [botState, setBotState] = useState<BotState>(() => loadPersistedBotState());
 
@@ -150,6 +154,30 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    const refreshBackend = async () => {
+      try {
+        const [status, trades] = await Promise.all([getBackendStatus(), getBackendTrades(100)]);
+        setBackendConnected(true);
+        setBackendHeartbeat(status.lastHeartbeatTs ?? 'N/A');
+        setStrategyCounters({
+          totalEvaluations: status.evaluationsCount,
+          totalSignals: status.signalsCount,
+          totalTradesExecuted: status.tradesExecutedCount,
+        });
+        setBotState(prev => ({ ...prev, autoPaperTrading: status.autoPaper, trades }));
+      } catch {
+        setBackendConnected(false);
+        // backend may be offline during frontend-only development.
+      }
+    };
+    void refreshBackend();
+    const id = window.setInterval(() => {
+      void refreshBackend();
+    }, 15000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
     const switchSymbol = async () => {
       setIsLoading(true);
       const newCandles = await fetchCandles(activeSymbol);
@@ -193,6 +221,7 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    if (backendConnected) return;
     const engine = new MultiSymbolEngine({
       symbols: availableSymbols.length > 0 ? availableSymbols : [activeSymbol],
       interval: '1m',
@@ -217,7 +246,7 @@ const App: React.FC = () => {
     });
     void engine.start();
     return () => engine.stop();
-  }, [availableSymbols, activeSymbol]);
+  }, [availableSymbols, activeSymbol, backendConnected]);
 
   const runBotCycle = useCallback(async () => {
     const ticker = await fetchLatestTicker(activeSymbol);
@@ -270,6 +299,7 @@ const App: React.FC = () => {
   }, [activeSymbol, confidenceThreshold]);
 
   useEffect(() => {
+    if (backendConnected) return;
     if (intervalRef.current) window.clearInterval(intervalRef.current);
     intervalRef.current = window.setInterval(() => {
       void runBotCycle();
@@ -277,7 +307,7 @@ const App: React.FC = () => {
     return () => {
       if (intervalRef.current) window.clearInterval(intervalRef.current);
     };
-  }, [runBotCycle]);
+  }, [runBotCycle, backendConnected]);
 
   const handleToggleBot = () => {
     setBotState(prev => ({ ...prev, isRunning: !prev.isRunning }));
@@ -452,6 +482,8 @@ const App: React.FC = () => {
         />
 
         <div className="mb-3 text-xs text-slate-400 font-mono">[STREAM LAG ms] <span className="text-slate-200">{streamLagMs}</span></div>
+        <div className="mb-3 text-xs text-slate-400 font-mono">[ENGINE HEARTBEAT] <span className="text-slate-200">{backendHeartbeat}</span></div>
+        <ManualTradePanel symbol={activeSymbol.replace('-', '')} />
         <div className="mb-4"><PerformanceDashboard trades={botState.trades} initialEquity={INITIAL_BALANCE} exposureBySymbol={exposureBySymbol} strategyCounters={strategyCounters} /></div>
         <div className="mb-4"><InstitutionalDashboard trades={botState.trades} latencyHeatmap={latencyHeatmap} /></div>
 

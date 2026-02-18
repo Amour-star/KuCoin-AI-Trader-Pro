@@ -1,0 +1,88 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum EngineMode {
+  PAPER
+  LIVE
+}
+
+enum DecisionType {
+  BUY
+  SELL
+  HOLD
+}
+
+enum TradeStatus {
+  OPEN
+  CLOSED
+  CANCELED
+}
+
+enum PositionStatus {
+  OPEN
+  CLOSED
+}
+
+model EngineState {
+  id                  String   @id @default("singleton")
+  mode                EngineMode @default(PAPER)
+  autoPaper           Boolean  @default(true)
+  confidenceThreshold Float    @default(0.6)
+  updatedAt           DateTime @updatedAt
+}
+
+model Decision {
+  id           String       @id @default(cuid())
+  ts           DateTime     @default(now())
+  symbol       String
+  timeframe    String
+  decision     DecisionType
+  confidence   Float
+  reasons      Json
+  featuresHash String
+  modelVersion String
+  trades       Trade[]
+
+  @@index([symbol, ts])
+}
+
+model Trade {
+  id         String      @id @default(cuid())
+  tsOpen     DateTime    @default(now())
+  tsClose    DateTime?
+  symbol     String
+  side       DecisionType
+  qty        Float
+  entryPrice Float
+  exitPrice  Float?
+  fee        Float       @default(0)
+  slPrice    Float?
+  tpPrice    Float?
+  slippage   Float       @default(0)
+  pnlAbs     Float?
+  pnlPct     Float?
+  status     TradeStatus @default(OPEN)
+  decisionId String?
+  decision   Decision?   @relation(fields: [decisionId], references: [id])
+
+  @@index([symbol, status, tsOpen])
+}
+
+model Position {
+  id        String         @id @default(cuid())
+  symbol    String
+  side      DecisionType
+  qty       Float
+  avgEntry  Float
+  openedAt  DateTime       @default(now())
+  closedAt  DateTime?
+  status    PositionStatus @default(OPEN)
+
+  @@index([symbol, status])
+}
