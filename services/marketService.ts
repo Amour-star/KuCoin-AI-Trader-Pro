@@ -1,5 +1,5 @@
 import { Candle, MarketData, ConnectivityStatus } from '../types';
-import * as ccxt from 'ccxt';
+import * as ccxt from 'https://esm.sh/ccxt@4.5.38';
 
 // --- CCXT Setup ---
 let exchange: any = null;
@@ -32,6 +32,13 @@ export const mockMarketData: MarketData[] = [
 mockMarketData.forEach(m => {
     lastKnownPrices[m.symbol] = m.price;
 });
+
+const isHotTradableUsdtSpot = (symbol: string): boolean => {
+  if (!symbol.endsWith('/USDT')) return false;
+  const base = symbol.split('/')[0];
+  const blockedSuffixes = ['3L', '3S', '5L', '5S', 'UP', 'DOWN', 'BULL', 'BEAR'];
+  return !blockedSuffixes.some(sfx => base.endsWith(sfx));
+};
 
 const calculateIndicators = (candles: Candle[]): Candle[] => {
   const emaShortPeriod = 9;
@@ -117,9 +124,9 @@ export const fetchTopCoins = async (): Promise<MarketData[]> => {
     const ex = getExchange();
     const tickers = await ex.fetchTickers();
     const sorted = Object.values(tickers)
-      .filter((t: any) => t.symbol.endsWith('/USDT'))
+      .filter((t: any) => isHotTradableUsdtSpot(t.symbol) && (t.quoteVolume || 0) > 0)
       .sort((a: any, b: any) => (b.quoteVolume || 0) - (a.quoteVolume || 0))
-      .slice(0, 5)
+      .slice(0, 10)
       .map((t: any) => {
         const symbol = t.symbol.replace('/', '-');
         lastKnownPrices[symbol] = t.last;

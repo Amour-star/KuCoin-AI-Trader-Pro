@@ -7,6 +7,8 @@ interface BotControlProps {
   state: BotState;
   market: MarketData;
   onToggle: () => void;
+  autoPaperTrading: boolean;
+  onToggleAutoPaperTrading: () => void;
   onRetrain: () => void;
   onReset: () => void;
   isTraining: boolean;
@@ -19,6 +21,8 @@ const BotControl: React.FC<BotControlProps> = ({
   state, 
   market, 
   onToggle, 
+  autoPaperTrading,
+  onToggleAutoPaperTrading,
   onRetrain, 
   onReset,
   isTraining, 
@@ -73,6 +77,16 @@ const BotControl: React.FC<BotControlProps> = ({
                     }`}
                 >
                     {state.isRunning ? <><Pause size={14} /> Stop</> : <><Play size={14} /> Start</>}
+                </button>
+                <button
+                    onClick={onToggleAutoPaperTrading}
+                    className={`px-3 py-2 rounded font-bold text-[10px] border uppercase tracking-wider transition ${
+                        autoPaperTrading
+                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                        : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-white'
+                    }`}
+                >
+                    Auto Paper
                 </button>
              </div>
          </div>

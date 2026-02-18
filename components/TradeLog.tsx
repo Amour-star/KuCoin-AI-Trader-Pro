@@ -43,7 +43,7 @@ const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
   }, [trades, typeFilter, symbolFilter, startDate, endDate]);
 
   const downloadCSV = () => {
-    const headers = ['ID', 'Symbol', 'Type', 'Price', 'Amount', 'Stop Loss', 'Take Profit', 'Fee', 'Time', 'PnL'];
+    const headers = ['ID', 'Symbol', 'Type', 'Price', 'Amount', 'Stop Loss', 'Take Profit', 'Exit Reason', 'Fee', 'Time', 'PnL'];
     const rows = filteredTrades.map(t => [
       t.id,
       t.symbol,
@@ -52,6 +52,7 @@ const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
       t.amount,
       t.stopLoss ? t.stopLoss.toFixed(2) : '',
       t.takeProfit ? t.takeProfit.toFixed(2) : '',
+      t.exitReason || '',
       t.fee,
       new Date(t.timestamp).toISOString(),
       t.pnl ? t.pnl.toFixed(4) : ''
@@ -174,6 +175,7 @@ const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
               <th className="pb-2 text-right bg-slate-900">Amount</th>
               <th className="pb-2 text-right bg-slate-900 text-red-400/70">SL</th>
               <th className="pb-2 text-right bg-slate-900 text-emerald-400/70">TP</th>
+              <th className="pb-2 text-right bg-slate-900">Exit</th>
               <th className="pb-2 text-right bg-slate-900">Fee</th>
               <th className="pb-2 text-right pr-2 bg-slate-900">PnL</th>
             </tr>
@@ -205,6 +207,9 @@ const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
                   {trade.takeProfit ? trade.takeProfit.toFixed(2) : '-'}
                 </td>
                 <td className="py-2 text-right font-mono text-slate-500">
+                  {trade.exitReason || '-'}
+                </td>
+                <td className="py-2 text-right font-mono text-slate-500">
                   {trade.fee.toFixed(4)}
                 </td>
                 <td className="py-2 text-right pr-2 font-mono">
@@ -220,7 +225,7 @@ const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
             ))}
             {filteredTrades.length === 0 && (
               <tr>
-                <td colSpan={8} className="text-center py-8 text-slate-600 italic">
+                <td colSpan={9} className="text-center py-8 text-slate-600 italic">
                   {trades.length === 0 ? "No trades recorded yet. Start the bot." : "No trades match the current filters."}
                 </td>
               </tr>

@@ -1,6 +1,6 @@
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { BotState, Candle, MarketData, ActionType, TrainingDataPoint, PendingTrade } from './types';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { BotState, Candle, MarketData, ActionType, TrainingDataPoint, PendingTrade, TradeExitReason } from './types';
 import { INITIAL_BALANCE, SYMBOLS, TICK_INTERVAL_MS, RETRAINING_INTERVAL_TICKS } from './constants';
 import { fetchCandles, fetchLatestTicker, fetchTopCoins, mockMarketData, getConnectivityStatus } from './services/marketService';
 import { getAgentAction, executeTrade, getTradePreview, checkAutoExits } from './services/botEngine';
@@ -10,8 +10,50 @@ import TradeLog from './components/TradeLog';
 import TradeConfirmationModal from './components/TradeConfirmationModal';
 import { Zap, Settings, RefreshCw, Globe } from 'lucide-react';
 
+const BOT_STATE_STORAGE_KEY = 'kucoin-paper-bot-state-v1';
+
+const createInitialBotState = (): BotState => ({
+  isRunning: false,
+  autoPaperTrading: true,
+  connectivity: 'CONNECTING',
+  balance: INITIAL_BALANCE,
+  holdings: {},
+  averageEntryPrices: {},
+  activePositions: [],
+  totalPortfolioValue: INITIAL_BALANCE,
+  activeSymbol: SYMBOLS[0],
+  marketStatus: 'ACTIVE',
+  lastTrainingTime: Date.now(),
+  trades: [],
+  trainingDataLog: []
+});
+
+const loadPersistedBotState = (): BotState => {
+  const fallback = createInitialBotState();
+  if (typeof window === 'undefined') return fallback;
+
+  try {
+    const raw = window.localStorage.getItem(BOT_STATE_STORAGE_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<BotState>;
+
+    return {
+      ...fallback,
+      ...parsed,
+      holdings: parsed.holdings || {},
+      averageEntryPrices: parsed.averageEntryPrices || {},
+      activePositions: parsed.activePositions || [],
+      trades: parsed.trades || [],
+      trainingDataLog: parsed.trainingDataLog || [],
+      autoPaperTrading: parsed.autoPaperTrading ?? true,
+    };
+  } catch {
+    return fallback;
+  }
+};
+
 const App: React.FC = () => {
-  const [activeSymbol, setActiveSymbol] = useState(SYMBOLS[0]);
+  const [activeSymbol, setActiveSymbol] = useState(() => loadPersistedBotState().activeSymbol || SYMBOLS[0]);
   const [availableSymbols, setAvailableSymbols] = useState<string[]>(SYMBOLS);
   const [marketData, setMarketData] = useState<MarketData>(mockMarketData[0]);
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -21,23 +63,18 @@ const App: React.FC = () => {
   const [pendingTrade, setPendingTrade] = useState<PendingTrade | null>(null);
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.6);
   
-  const [botState, setBotState] = useState<BotState>({
-    isRunning: false,
-    connectivity: 'CONNECTING',
-    balance: INITIAL_BALANCE,
-    holdings: {},
-    averageEntryPrices: {},
-    activePositions: [],
-    totalPortfolioValue: INITIAL_BALANCE,
-    activeSymbol: SYMBOLS[0],
-    marketStatus: 'ACTIVE',
-    lastTrainingTime: Date.now(),
-    trades: [],
-    trainingDataLog: []
-  });
+  const [botState, setBotState] = useState<BotState>(() => loadPersistedBotState());
 
   const tickCountRef = useRef(0);
   const intervalRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(BOT_STATE_STORAGE_KEY, JSON.stringify(botState));
+    } catch {
+      // Ignore storage errors (private mode / quota).
+    }
+  }, [botState]);
 
   useEffect(() => {
     const initData = async () => {
@@ -70,6 +107,10 @@ const App: React.FC = () => {
       if (!isLoading) switchSymbol();
   }, [activeSymbol]);
 
+  useEffect(() => {
+    setBotState(prev => ({ ...prev, activeSymbol }));
+  }, [activeSymbol]);
+
   const runBotCycle = useCallback(async () => {
     const ticker = await fetchLatestTicker(activeSymbol);
     if (!ticker) return;
@@ -93,6 +134,7 @@ const App: React.FC = () => {
     } : null;
 
     if (!currentCandle) return;
+    const candlesForDecision = [...candles.slice(0, -1), currentCandle];
 
     setBotState(currentState => {
         return {
@@ -110,13 +152,45 @@ const App: React.FC = () => {
         }
     }
 
-    if (pendingTrade) return;
+    if (pendingTrade && !botState.autoPaperTrading) return;
 
     if (botState.isRunning && !isTraining) {
-        const { action, confidence } = getAgentAction(currentCandle);
+        const { action, confidence } = getAgentAction(candlesForDecision);
         if (action !== ActionType.HOLD && confidence > confidenceThreshold) {
-             const preview = getTradePreview(botState, action, ticker.price, activeSymbol);
-             if (preview) setPendingTrade(preview);
+             const preview = getTradePreview(botState, action, ticker.price, activeSymbol, candlesForDecision);
+             if (preview) {
+                if (botState.autoPaperTrading) {
+                    setBotState(currentState => {
+                        const newState = executeTrade(
+                            currentState,
+                            preview.action,
+                            preview.price,
+                            preview.symbol,
+                            preview.amount,
+                            preview.stopLoss,
+                            preview.takeProfit,
+                            { exitReason: 'SIGNAL' }
+                        );
+                        const lastTrade = newState.trades.length > 0 ? newState.trades[0] : null;
+                        const pnl = (lastTrade && lastTrade.type === ActionType.SELL && lastTrade.symbol === preview.symbol)
+                            ? lastTrade.pnl
+                            : undefined;
+
+                        const logEntry: TrainingDataPoint = {
+                            timestamp: Date.now(),
+                            candle: currentCandle,
+                            action: preview.action,
+                            confidence,
+                            marketStatus: currentState.marketStatus,
+                            pnl
+                        };
+                        newState.trainingDataLog = [logEntry, ...newState.trainingDataLog].slice(0, 500);
+                        return newState;
+                    });
+                } else {
+                    setPendingTrade(preview);
+                }
+             }
         } else {
              setBotState(currentState => {
                 const newState = { ...currentState, marketStatus: newMarketStatus };
@@ -164,6 +238,11 @@ const App: React.FC = () => {
     setBotState(prev => ({ ...prev, isRunning: !prev.isRunning }));
   };
 
+  const handleToggleAutoPaperTrading = () => {
+    setBotState(prev => ({ ...prev, autoPaperTrading: !prev.autoPaperTrading }));
+    setPendingTrade(null);
+  };
+
   const handleRetrain = () => {
       if (isTraining) return;
       setIsTraining(true);
@@ -188,13 +267,14 @@ const App: React.FC = () => {
     if (window.confirm("Are you sure you want to reset your paper trading session?")) {
         setBotState({
             isRunning: false,
+            autoPaperTrading: botState.autoPaperTrading,
             connectivity: getConnectivityStatus(),
             balance: INITIAL_BALANCE,
             holdings: {},
             averageEntryPrices: {},
             activePositions: [],
             totalPortfolioValue: INITIAL_BALANCE,
-            activeSymbol: SYMBOLS[0],
+            activeSymbol: activeSymbol,
             marketStatus: 'ACTIVE',
             lastTrainingTime: Date.now(),
             trades: [],
@@ -204,7 +284,7 @@ const App: React.FC = () => {
     }
   };
 
-  const confirmTrade = (finalTrade: PendingTrade) => {
+  const confirmTrade = (finalTrade: PendingTrade, exitReason: TradeExitReason = 'MANUAL') => {
       setBotState(currentState => {
           let newState = executeTrade(
               currentState, 
@@ -213,7 +293,8 @@ const App: React.FC = () => {
               finalTrade.symbol,
               finalTrade.amount,
               finalTrade.stopLoss,
-              finalTrade.takeProfit
+              finalTrade.takeProfit,
+              { exitReason }
           );
           const lastTrade = newState.trades.length > 0 ? newState.trades[0] : null;
           const pnl = (lastTrade && lastTrade.type === ActionType.SELL && lastTrade.symbol === finalTrade.symbol) 
@@ -234,10 +315,47 @@ const App: React.FC = () => {
       setPendingTrade(null);
   };
 
+  const backtestMetrics = useMemo(() => {
+    const closedTrades = botState.trades
+      .filter(t => t.type === ActionType.SELL && typeof t.pnl === 'number')
+      .sort((a, b) => a.timestamp - b.timestamp);
+
+    const closedCount = closedTrades.length;
+    const winningTrades = closedTrades.filter(t => (t.pnl || 0) > 0).length;
+    const winRate = closedCount > 0 ? (winningTrades / closedCount) * 100 : 0;
+
+    const grossProfit = closedTrades.reduce((acc, t) => acc + Math.max(t.pnl || 0, 0), 0);
+    const grossLossAbs = closedTrades.reduce((acc, t) => acc + Math.abs(Math.min(t.pnl || 0, 0)), 0);
+    const profitFactor = grossLossAbs > 0
+      ? grossProfit / grossLossAbs
+      : grossProfit > 0
+        ? Number.POSITIVE_INFINITY
+        : 0;
+
+    let equity = INITIAL_BALANCE;
+    let peak = INITIAL_BALANCE;
+    let maxDrawdownPct = 0;
+
+    for (const trade of closedTrades) {
+      equity += trade.pnl || 0;
+      if (equity > peak) peak = equity;
+
+      const drawdownPct = peak > 0 ? ((peak - equity) / peak) * 100 : 0;
+      if (drawdownPct > maxDrawdownPct) maxDrawdownPct = drawdownPct;
+    }
+
+    return {
+      closedCount,
+      winRate,
+      profitFactor,
+      maxDrawdownPct,
+    };
+  }, [botState.trades]);
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col">
       <TradeConfirmationModal 
-          isOpen={!!pendingTrade} 
+          isOpen={!botState.autoPaperTrading && !!pendingTrade} 
           trade={pendingTrade} 
           currentEntryPrice={pendingTrade ? botState.averageEntryPrices[pendingTrade.symbol] : undefined}
           onConfirm={confirmTrade} 
@@ -295,6 +413,8 @@ const App: React.FC = () => {
             trainingMetrics={trainingMetrics}
             confidenceThreshold={confidenceThreshold}
             setConfidenceThreshold={setConfidenceThreshold}
+            autoPaperTrading={botState.autoPaperTrading}
+            onToggleAutoPaperTrading={handleToggleAutoPaperTrading}
         />
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-auto lg:h-[650px]">
@@ -313,15 +433,21 @@ const App: React.FC = () => {
               <div className="grid grid-cols-3 gap-4 mb-4 lg:mb-0">
                   <div className="bg-slate-900 p-4 rounded-lg border border-slate-800 shadow-sm">
                       <div className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Win Rate</div>
-                      <div className="text-xl font-bold text-slate-100 font-mono">68.4%</div>
+                      <div className={`text-xl font-bold font-mono ${backtestMetrics.winRate >= 50 ? 'text-emerald-400' : 'text-red-400'}`}>
+                        {backtestMetrics.winRate.toFixed(1)}%
+                      </div>
                   </div>
                   <div className="bg-slate-900 p-4 rounded-lg border border-slate-800 shadow-sm">
                       <div className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Profit Factor</div>
-                      <div className="text-xl font-bold text-emerald-400 font-mono">1.85</div>
+                      <div className={`text-xl font-bold font-mono ${backtestMetrics.profitFactor >= 1 ? 'text-emerald-400' : 'text-red-400'}`}>
+                        {Number.isFinite(backtestMetrics.profitFactor) ? backtestMetrics.profitFactor.toFixed(2) : 'INF'}
+                      </div>
                   </div>
                   <div className="bg-slate-900 p-4 rounded-lg border border-slate-800 shadow-sm">
                       <div className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Drawdown</div>
-                      <div className="text-xl font-bold text-red-400 font-mono">-3.2%</div>
+                      <div className={`text-xl font-bold font-mono ${backtestMetrics.maxDrawdownPct > 0 ? 'text-red-400' : 'text-slate-100'}`}>
+                        -{backtestMetrics.maxDrawdownPct.toFixed(2)}%
+                      </div>
                   </div>
               </div>
            </div>

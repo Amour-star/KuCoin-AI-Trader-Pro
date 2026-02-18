@@ -4,6 +4,7 @@ export enum ActionType {
   HOLD = 'HOLD'
 }
 
+export type TradeExitReason = 'SIGNAL' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'MANUAL';
 export type ConnectivityStatus = 'REALTIME' | 'SIMULATED' | 'CONNECTING';
 
 export interface Candle {
@@ -30,6 +31,7 @@ export interface Trade {
   fee: number;
   stopLoss?: number;
   takeProfit?: number;
+  exitReason?: TradeExitReason;
 }
 
 export interface Position {
@@ -53,6 +55,7 @@ export interface TrainingDataPoint {
 
 export interface BotState {
   isRunning: boolean;
+  autoPaperTrading: boolean;
   connectivity: ConnectivityStatus;
   balance: number; // USDT
   holdings: Record<string, number>; // Symbol -> Amount

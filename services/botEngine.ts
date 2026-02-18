@@ -1,61 +1,95 @@
-import { ActionType, BotState, Candle, Trade, PendingTrade, Position, TrainingDataPoint } from '../types';
+import { ActionType, BotState, Candle, Trade, PendingTrade, Position, TrainingDataPoint, TradeExitReason } from '../types';
 import { TRADING_FEE_RATE } from '../constants';
 
-// Simulating a trained PPO agent policy
-export const getAgentAction = (candle: Candle): { action: ActionType; confidence: number } => {
-  const { rsi, emaShort, emaLong, close } = candle;
-  
-  // Default Hold
-  let action = ActionType.HOLD;
-  let confidence = 0.5;
+const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
 
-  if (rsi && emaShort && emaLong) {
-      // Overbought / Oversold logic mixed with Trend Following
-      if (rsi < 30 && emaShort > emaLong) {
-          action = ActionType.BUY;
-          confidence = 0.8 + Math.random() * 0.1;
-      } else if (rsi > 70 && emaShort < emaLong) {
-          action = ActionType.SELL;
-          confidence = 0.8 + Math.random() * 0.1;
-      } else if (emaShort > emaLong && close > emaShort) {
-          // Strong Trend
-          action = Math.random() > 0.7 ? ActionType.BUY : ActionType.HOLD;
-          confidence = 0.6;
-      } else if (emaShort < emaLong && close < emaShort) {
-          // Strong Downtrend
-          action = Math.random() > 0.7 ? ActionType.SELL : ActionType.HOLD;
-          confidence = 0.6;
-      }
+const getAverageRangePct = (candles: Candle[], length: number = 20): number => {
+  if (candles.length === 0) return 0;
+  const window = candles.slice(-length);
+  const ranges = window.map(c => (c.high - c.low) / (c.close || 1));
+  return ranges.reduce((acc, v) => acc + v, 0) / Math.max(ranges.length, 1);
+};
+
+const getMomentum = (candles: Candle[], lookback: number): number => {
+  if (candles.length <= lookback) return 0;
+  const last = candles[candles.length - 1].close;
+  const previous = candles[candles.length - 1 - lookback].close;
+  return previous > 0 ? (last - previous) / previous : 0;
+};
+
+// Refined deterministic signal engine (trend + momentum + RSI + volatility + volume regime).
+export const getAgentAction = (candles: Candle[]): { action: ActionType; confidence: number } => {
+  if (candles.length < 25) {
+    return { action: ActionType.HOLD, confidence: 0.35 };
   }
 
-  // Random noise to simulate "learning" or imperfect exploration
-  if (Math.random() < 0.1) {
-      const actions = [ActionType.BUY, ActionType.SELL, ActionType.HOLD];
-      action = actions[Math.floor(Math.random() * actions.length)];
-      confidence = 0.3; // Low confidence exploration
+  const current = candles[candles.length - 1];
+  const avgRangePct = getAverageRangePct(candles, 20);
+  const fastMomentum = getMomentum(candles, 3);
+  const slowMomentum = getMomentum(candles, 10);
+
+  const trendComponent = (current.emaShort && current.emaLong)
+    ? (current.emaShort - current.emaLong) / (current.close || 1)
+    : 0;
+
+  const rsiComponent = typeof current.rsi === 'number'
+    ? (50 - current.rsi) / 50 // >0 buy bias, <0 sell bias
+    : 0;
+
+  const avgVolume = candles.slice(-20).reduce((acc, c) => acc + c.volume, 0) / 20;
+  const volumeComponent = avgVolume > 0 ? ((current.volume - avgVolume) / avgVolume) : 0;
+
+  // Refinement score (higher absolute score => stronger conviction).
+  const rawScore =
+    (trendComponent * 8.0) * 0.35 +
+    (fastMomentum * 6.0) * 0.25 +
+    (slowMomentum * 4.0) * 0.20 +
+    (rsiComponent) * 0.15 +
+    (volumeComponent) * 0.05;
+
+  // Penalize very low or very high volatility regimes.
+  const volatilityPenalty =
+    avgRangePct < 0.0012 ? 0.80 :
+    avgRangePct > 0.03 ? 0.85 :
+    1.0;
+
+  const score = rawScore * volatilityPenalty;
+  const absScore = Math.abs(score);
+
+  if (absScore < 0.18) {
+    return { action: ActionType.HOLD, confidence: clamp(0.45 - absScore, 0.2, 0.45) };
   }
 
-  return { action, confidence };
+  return {
+    action: score > 0 ? ActionType.BUY : ActionType.SELL,
+    confidence: clamp(0.55 + absScore, 0.55, 0.95),
+  };
 };
 
 export const getTradePreview = (
     state: BotState,
     action: ActionType,
     price: number,
-    symbol: string
+    symbol: string,
+    candles: Candle[]
 ): PendingTrade | null => {
+    const avgRangePct = getAverageRangePct(candles, 20);
+
     if (action === ActionType.BUY) {
-        // Buy with 20% of available balance
-        const tradeValueUSDT = state.balance * 0.2;
+        // Volatility-aware sizing for paper mode.
+        const normalizedVol = clamp(avgRangePct / 0.02, 0, 1.5);
+        const allocationPct = clamp(0.22 - normalizedVol * 0.08, 0.08, 0.22);
+        const tradeValueUSDT = state.balance * allocationPct;
         if (tradeValueUSDT <= 10) return null; // Minimum trade size
 
         const fee = tradeValueUSDT * TRADING_FEE_RATE;
-        // Amount of crypto received is (Value - Fee) / Price
         const amountCrypto = (tradeValueUSDT - fee) / price;
 
-        // Auto-calculate SL/TP for preview (Stop Loss -2%, Take Profit +4%)
-        const stopLoss = price * 0.98;
-        const takeProfit = price * 1.04;
+        // Dynamic SL/TP based on current volatility regime.
+        const stopLossPct = clamp(avgRangePct * 1.8, 0.008, 0.03);
+        const takeProfitPct = clamp(stopLossPct * 1.9, 0.016, 0.07);
+        const stopLoss = price * (1 - stopLossPct);
+        const takeProfit = price * (1 + takeProfitPct);
 
         return {
             symbol,
@@ -99,7 +133,8 @@ export const executeTrade = (
     symbol: string,
     amount?: number, // Explicit amount to trade (crypto units)
     stopLoss?: number,
-    takeProfit?: number
+    takeProfit?: number,
+    metadata?: { exitReason?: TradeExitReason }
 ): BotState => {
     let newState = { ...state };
     
@@ -194,7 +229,10 @@ export const executeTrade = (
                 amount: finalSellAmount,
                 timestamp: Date.now(),
                 fee: feeCost,
-                pnl: pnl 
+                pnl: pnl,
+                stopLoss,
+                takeProfit,
+                exitReason: metadata?.exitReason || 'SIGNAL',
             };
             newState.trades = [trade, ...newState.trades];
 
@@ -258,15 +296,15 @@ export const checkAutoExits = (
     const symbolPositions = newState.activePositions.filter(p => p.symbol === symbol);
 
     for (const pos of symbolPositions) {
-        let triggeredAction: 'SL' | 'TP' | null = null;
+        let triggeredAction: TradeExitReason | null = null;
 
         // Check Stop Loss
         if (pos.stopLoss && currentPrice <= pos.stopLoss) {
-            triggeredAction = 'SL';
+            triggeredAction = 'STOP_LOSS';
         }
         // Check Take Profit
         else if (pos.takeProfit && currentPrice >= pos.takeProfit) {
-            triggeredAction = 'TP';
+            triggeredAction = 'TAKE_PROFIT';
         }
 
         if (triggeredAction) {
@@ -276,7 +314,10 @@ export const checkAutoExits = (
                 ActionType.SELL,
                 currentPrice,
                 symbol,
-                pos.amount
+                pos.amount,
+                pos.stopLoss,
+                pos.takeProfit,
+                { exitReason: triggeredAction }
             );
 
             // Log this specific auto-action to training log

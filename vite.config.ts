@@ -6,6 +6,11 @@ export default defineConfig({
   server: {
     port: 3000,
   },
+  resolve: {
+    alias: {
+      ccxt: 'https://esm.sh/ccxt@4.5.38',
+    },
+  },
   optimizeDeps: {
     // ccxt has dynamic imports for node-only modules that break vite pre-bundling
     exclude: ['ccxt'],
@@ -14,6 +19,7 @@ export default defineConfig({
     rollupOptions: {
       // These modules are dynamically imported by ccxt but not needed in the browser
       external: [
+        'ccxt',
         'http-proxy-agent',
         'https-proxy-agent',
         'socks-proxy-agent',
