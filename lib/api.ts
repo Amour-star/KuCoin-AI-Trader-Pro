@@ -50,21 +50,27 @@ export type SettingsPayload = {
 };
 
 const globalEnv = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
-const API_BASE = globalEnv?.NEXT_PUBLIC_API_URL;
 
-if (!API_BASE) {
-  throw new Error('Missing NEXT_PUBLIC_API_URL. Add it to your frontend environment variables.');
-}
+function getApiBase(): string {
+  const API_BASE = globalEnv?.NEXT_PUBLIC_API_URL;
 
-if (!API_BASE.startsWith('https://')) {
-  throw new Error('NEXT_PUBLIC_API_URL must use HTTPS in production.');
+  if (!API_BASE) {
+    throw new Error('Missing NEXT_PUBLIC_API_URL. Add it in Vercel project environment variables.');
+  }
+
+  if (!API_BASE.startsWith('https://')) {
+    throw new Error('NEXT_PUBLIC_API_URL must use HTTPS.');
+  }
+
+  return API_BASE;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const apiBase = getApiBase();
   let response: Response;
 
   try {
-    response = await fetch(`${API_BASE}${path}`, {
+    response = await fetch(`${apiBase}${path}`, {
       ...init,
       headers: {
         'Content-Type': 'application/json',
