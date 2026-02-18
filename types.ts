@@ -108,7 +108,10 @@ export interface Trade {
   aiNotes?: string[];
   strategyVersion?: string;
   simulation?: ExecutionSimulation;
+  decisionId?: string;
+  idempotencyKey?: string;
 }
+
 
 export interface Position {
   id: string;
@@ -166,6 +169,29 @@ export interface MarketData {
   change24h: number;
 }
 
+
+export interface DecisionRecord {
+  id: string;
+  ts: number;
+  symbol: string;
+  timeframe: string;
+  inputsHash: string;
+  signal: ActionType;
+  confidence: number;
+  reasons: string[];
+  modelVersion?: string;
+}
+
+export interface ExecutionReceipt {
+  decisionId: string;
+  orderId: string;
+  status: 'ACCEPTED' | 'SKIPPED' | 'REJECTED' | 'FILLED' | 'FAILED';
+  filledQty: number;
+  avgPrice: number;
+  fees: number;
+  error?: string;
+}
+
 export interface PendingTrade {
   symbol: string;
   action: ActionType;
@@ -183,7 +209,10 @@ export interface PendingTrade {
   aiNotes?: string[];
   strategyVersion?: string;
   simulation?: ExecutionSimulation;
+  decisionId?: string;
+  idempotencyKey?: string;
 }
+
 
 export interface PerformanceMetrics {
   totalTrades: number;

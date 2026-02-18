@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "trade:once": "node --experimental-strip-types --es-module-specifier-resolution=node scripts/tradeOnce.ts",
+    "trade:paper": "node --experimental-strip-types --es-module-specifier-resolution=node scripts/tradePaperLoop.ts",
+    "trade:history": "node --experimental-strip-types --es-module-specifier-resolution=node scripts/showHistory.ts",
+    "test:bot": "node --experimental-strip-types --es-module-specifier-resolution=node tests/runBotTests.ts"
   },
   "dependencies": {
     "vite": "^7.3.1",
