@@ -2,9 +2,19 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
+  // Allow KUCOIN_* variables to be read via import.meta.env on the client.
+  envPrefix: ['VITE_', 'KUCOIN_'],
   plugins: [react()],
   server: {
     port: 3000,
+    proxy: {
+      '/kucoin-api': {
+        target: 'https://api.kucoin.com',
+        changeOrigin: true,
+        secure: true,
+        rewrite: path => path.replace(/^\/kucoin-api/, ''),
+      },
+    },
   },
   resolve: {
     alias: {

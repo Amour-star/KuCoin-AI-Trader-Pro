@@ -79,15 +79,17 @@ const App: React.FC = () => {
   useEffect(() => {
     const initData = async () => {
       setIsLoading(true);
+      let symbolToLoad = activeSymbol;
       const topCoins = await fetchTopCoins();
       if (topCoins.length > 0) {
         setAvailableSymbols(topCoins.map(c => c.symbol));
         if (!topCoins.find(c => c.symbol === activeSymbol)) {
-           setActiveSymbol(topCoins[0].symbol);
+           symbolToLoad = topCoins[0].symbol;
+           setActiveSymbol(symbolToLoad);
            setMarketData(topCoins[0]);
         }
       }
-      const initialCandles = await fetchCandles(activeSymbol);
+      const initialCandles = await fetchCandles(symbolToLoad);
       setCandles(initialCandles);
       setIsLoading(false);
     };

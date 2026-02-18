@@ -15,6 +15,13 @@ View your app in AI Studio: https://ai.studio/apps/drive/1WF0ktdZt9HHPWlxut04Nwi
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Add your KuCoin settings in `.env.local`:
+   ```
+   KUCOIN_API_KEY=
+   KUCOIN_API_SECRET=
+   KUCOIN_API_PASSPHRASE=
+   KUCOIN_SANDBOX=true
+   ```
+   Security note: this app runs in the browser. Do not use real production API keys in client-side apps.
 3. Run the app:
    `npm run dev`
