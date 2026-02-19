@@ -1,0 +1,153 @@
+export type EngineStatus = {
+  running: boolean;
+  lastHeartbeat: string | null;
+  evaluations: number;
+  signals: number;
+  tradesExecuted: number;
+  openPositions: number;
+  autoPaper: boolean;
+  confidenceThreshold: number;
+};
+
+export type TradeRow = {
+  id: string;
+  symbol: string;
+  side: 'BUY' | 'SELL' | 'HOLD';
+  qty: number;
+  entry_price: number;
+  exit_price: number | null;
+  sl_price: number | null;
+  tp_price: number | null;
+  fee: number;
+  slippage: number;
+  pnl_abs: number | null;
+  pnl_pct: number | null;
+  status: string;
+  opened_at: string;
+  closed_at: string | null;
+};
+
+export type DecisionRow = {
+  ts: string;
+  symbol: string;
+  decision: 'BUY' | 'SELL' | 'HOLD';
+  confidence: number;
+  reasons: string[];
+  model_version: string;
+};
+
+export type ForceTradePayload = {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  notionalUsd: number;
+  tpPct: number;
+  slPct: number;
+};
+
+export type SettingsPayload = {
+  confidenceThreshold?: number;
+  autoPaper?: boolean;
+};
+
+const globalEnv = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+
+function getApiBase(): string {
+  const API_BASE = globalEnv?.NEXT_PUBLIC_API_URL;
+
+  if (!API_BASE) {
+    throw new Error('Missing NEXT_PUBLIC_API_URL. Add it in Vercel project environment variables.');
+  }
+
+  if (!API_BASE.startsWith('https://')) {
+    throw new Error('NEXT_PUBLIC_API_URL must use HTTPS.');
+  }
+
+  return API_BASE;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const apiBase = getApiBase();
+  let response: Response;
+
+  try {
+    response = await fetch(`${apiBase}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new Error('Backend disconnected');
+  }
+
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `Request failed: ${response.status}`);
+  }
+
+  return response.json() as Promise<T>;
+}
+
+export async function fetchStatus(): Promise<EngineStatus> {
+  const status = await request<any>('/api/status');
+  return {
+    running: Boolean(status.running),
+    lastHeartbeat: status.lastHeartbeat ?? status.lastHeartbeatTs ?? null,
+    evaluations: Number(status.evaluations ?? status.evaluationsCount ?? 0),
+    signals: Number(status.signals ?? status.signalsCount ?? 0),
+    tradesExecuted: Number(status.tradesExecuted ?? status.tradesExecutedCount ?? 0),
+    openPositions: Number(status.openPositions ?? 0),
+    autoPaper: Boolean(status.autoPaper),
+    confidenceThreshold: Number(status.confidenceThreshold ?? 0.6),
+  };
+}
+
+export async function fetchTrades(limit = 100): Promise<TradeRow[]> {
+  const rows = await request<any[]>('/api/trades?limit=' + limit);
+
+  return rows.map((row) => ({
+    id: String(row.id),
+    symbol: String(row.symbol),
+    side: row.side,
+    qty: Number(row.qty ?? 0),
+    entry_price: Number(row.entry_price ?? row.entryPrice ?? 0),
+    exit_price: row.exit_price ?? row.exitPrice ?? null,
+    sl_price: row.sl_price ?? row.slPrice ?? null,
+    tp_price: row.tp_price ?? row.tpPrice ?? null,
+    fee: Number(row.fee ?? 0),
+    slippage: Number(row.slippage ?? 0),
+    pnl_abs: row.pnl_abs ?? row.pnlAbs ?? null,
+    pnl_pct: row.pnl_pct ?? row.pnlPct ?? null,
+    status: String(row.status ?? 'UNKNOWN'),
+    opened_at: String(row.opened_at ?? row.tsOpen),
+    closed_at: row.closed_at ?? row.tsClose ?? null,
+  }));
+}
+
+export async function fetchDecisions(limit = 100): Promise<DecisionRow[]> {
+  const rows = await request<any[]>('/api/decisions?limit=' + limit);
+
+  return rows.map((row) => ({
+    ts: String(row.ts),
+    symbol: String(row.symbol),
+    decision: row.decision,
+    confidence: Number(row.confidence ?? 0),
+    reasons: Array.isArray(row.reasons) ? row.reasons.map((item: unknown) => String(item)) : [String(row.reasons ?? '')],
+    model_version: String(row.model_version ?? row.modelVersion ?? 'unknown'),
+  }));
+}
+
+export async function forceTrade(payload: ForceTradePayload): Promise<{ tradeId: string; decisionId: string }> {
+  return request('/api/force-trade', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateSettings(payload: SettingsPayload): Promise<{ autoPaper: boolean; confidenceThreshold: number }> {
+  return request('/api/settings', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
