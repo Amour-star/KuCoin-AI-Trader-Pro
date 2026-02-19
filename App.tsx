@@ -10,7 +10,7 @@ import {
   fetchTrades,
   forceTrade,
   updateSettings,
-} from './lib/api';
+} from './src/lib/api';
 
 const PAGE_SIZE = 10;
 
@@ -68,9 +68,8 @@ const App: React.FC = () => {
       setStatus(next);
       setSettingsForm({ confidenceThreshold: next.confidenceThreshold, autoPaper: next.autoPaper });
       setBackendDisconnected(false);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed loading status';
-      setStatusError(message);
+    } catch {
+      setStatusError('Backend unreachable');
       setBackendDisconnected(true);
     } finally {
       setStatusLoading(false);
@@ -84,9 +83,8 @@ const App: React.FC = () => {
       const next = await fetchTrades(100);
       setTrades(next);
       setBackendDisconnected(false);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed loading trades';
-      setTradesError(message);
+    } catch {
+      setTradesError('Backend unreachable');
       setBackendDisconnected(true);
     } finally {
       setTradesLoading(false);
@@ -100,9 +98,8 @@ const App: React.FC = () => {
       const next = await fetchDecisions(100);
       setDecisions(next);
       setBackendDisconnected(false);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed loading decisions';
-      setDecisionsError(message);
+    } catch {
+      setDecisionsError('Backend unreachable');
       setBackendDisconnected(true);
     } finally {
       setDecisionsLoading(false);
@@ -143,9 +140,8 @@ const App: React.FC = () => {
       await forceTrade(forceTradeForm);
       setFormStatus('Force trade submitted successfully.');
       await loadTrades();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to submit force trade';
-      setFormStatus(message);
+    } catch {
+      setFormStatus('Backend unreachable');
     }
   };
 
@@ -158,9 +154,8 @@ const App: React.FC = () => {
       setSettingsForm(result);
       setFormStatus('Settings updated successfully.');
       await loadStatus();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to update settings';
-      setFormStatus(message);
+    } catch {
+      setFormStatus('Backend unreachable');
     }
   };
 
