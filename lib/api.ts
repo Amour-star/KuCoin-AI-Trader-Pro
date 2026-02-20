@@ -3,29 +3,24 @@ const API_BASE =
   'https://ai-trader-backend-production.up.railway.app';
 
 if (typeof window !== 'undefined') {
-  console.log('NEXT_PUBLIC_API_URL:', process.env.NEXT_PUBLIC_API_URL);
+  console.log('API URL:', process.env.NEXT_PUBLIC_API_URL);
 }
 
 export async function apiFetch(path: string, options?: RequestInit) {
-  try {
-    const res = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(options?.headers || {}),
-      },
-    });
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options?.headers || {}),
+    },
+  });
 
-    if (!res.ok) {
-      throw new Error(`API error: ${res.status}`);
-    }
-
-    return await res.json();
-  } catch (err) {
-    console.error('API fetch failed:', err);
-    throw err;
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}`);
   }
+
+  return res.json();
 }
 
 export type EngineStatus = {
@@ -94,7 +89,7 @@ export async function fetchStatus(): Promise<EngineStatus> {
 }
 
 export async function fetchTrades(limit = 100): Promise<TradeRow[]> {
-  const rows = await apiFetch(`/api/trades?limit=${limit}`) as any[];
+  const rows = (await apiFetch(`/api/trades?limit=${limit}`)) as any[];
   return rows.map((row) => ({
     id: String(row.id),
     symbol: String(row.symbol),
@@ -115,7 +110,7 @@ export async function fetchTrades(limit = 100): Promise<TradeRow[]> {
 }
 
 export async function fetchDecisions(limit = 100): Promise<DecisionRow[]> {
-  const rows = await apiFetch(`/api/decisions?limit=${limit}`) as any[];
+  const rows = (await apiFetch(`/api/decisions?limit=${limit}`)) as any[];
   return rows.map((row) => ({
     ts: String(row.ts),
     symbol: String(row.symbol),

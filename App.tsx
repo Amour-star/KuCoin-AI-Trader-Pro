@@ -1,5 +1,6 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  apiFetch,
   DecisionRow,
   EngineStatus,
   ForceTradePayload,
@@ -33,7 +34,7 @@ const pnlColor = (value: number | null) => {
 };
 
 const getErrorMessage = (error: unknown) => {
-  if (error instanceof Error && error.message.includes('API error: 500')) {
+  if (error instanceof Error && error.message.includes('API error 500')) {
     return 'Backend error';
   }
   return 'Backend unreachable';
@@ -52,7 +53,7 @@ const App: React.FC = () => {
   const [tradesError, setTradesError] = useState<string | null>(null);
   const [decisionsError, setDecisionsError] = useState<string | null>(null);
 
-  const [backendState, setBackendState] = useState<'connected' | 'unreachable' | 'error'>('connected');
+  const [connected, setConnected] = useState(false);
 
   const [tradePage, setTradePage] = useState(1);
   const [decisionPage, setDecisionPage] = useState(1);
@@ -67,6 +68,16 @@ const App: React.FC = () => {
   const [settingsForm, setSettingsForm] = useState<SettingsPayload>({ confidenceThreshold: 0.6, autoPaper: true });
   const [formStatus, setFormStatus] = useState<string | null>(null);
 
+  const checkConnection = useCallback(async () => {
+    try {
+      await apiFetch('/api/status');
+      setConnected(true);
+    } catch (err) {
+      console.error(err);
+      setConnected(false);
+    }
+  }, []);
+
   const loadStatus = useCallback(async () => {
     try {
       setStatusLoading(true);
@@ -74,11 +85,10 @@ const App: React.FC = () => {
       const next = await fetchStatus();
       setStatus(next);
       setSettingsForm({ confidenceThreshold: next.confidenceThreshold, autoPaper: next.autoPaper });
-      setBackendState('connected');
+      setConnected(true);
     } catch (error) {
-      const message = getErrorMessage(error);
-      setStatusError(message);
-      setBackendState(message === 'Backend error' ? 'error' : 'unreachable');
+      setConnected(false);
+      setStatusError(getErrorMessage(error));
     } finally {
       setStatusLoading(false);
     }
@@ -90,11 +100,10 @@ const App: React.FC = () => {
       setTradesError(null);
       const next = await fetchTrades(100);
       setTrades(next);
-      setBackendState('connected');
+      setConnected(true);
     } catch (error) {
-      const message = getErrorMessage(error);
-      setTradesError(message);
-      setBackendState(message === 'Backend error' ? 'error' : 'unreachable');
+      setConnected(false);
+      setTradesError(getErrorMessage(error));
     } finally {
       setTradesLoading(false);
     }
@@ -106,21 +115,21 @@ const App: React.FC = () => {
       setDecisionsError(null);
       const next = await fetchDecisions(100);
       setDecisions(next);
-      setBackendState('connected');
+      setConnected(true);
     } catch (error) {
-      const message = getErrorMessage(error);
-      setDecisionsError(message);
-      setBackendState(message === 'Backend error' ? 'error' : 'unreachable');
+      setConnected(false);
+      setDecisionsError(getErrorMessage(error));
     } finally {
       setDecisionsLoading(false);
     }
   }, []);
 
   useEffect(() => {
+    void checkConnection();
     void loadStatus();
     void loadTrades();
     void loadDecisions();
-  }, [loadStatus, loadTrades, loadDecisions]);
+  }, [checkConnection, loadStatus, loadTrades, loadDecisions]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -177,14 +186,11 @@ const App: React.FC = () => {
           <p className="text-slate-400 text-sm">Backend-driven dashboard (Railway + Neon)</p>
         </header>
 
-        {backendState === 'connected' && (
+        {connected && (
           <div className="rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 px-4 py-2">Connected</div>
         )}
-        {backendState === 'unreachable' && (
+        {!connected && (
           <div className="rounded border border-red-500/30 bg-red-500/10 text-red-300 px-4 py-2">Backend unreachable</div>
-        )}
-        {backendState === 'error' && (
-          <div className="rounded border border-amber-500/30 bg-amber-500/10 text-amber-300 px-4 py-2">Backend error</div>
         )}
 
         <section className="bg-slate-900 border border-slate-800 rounded p-4">
