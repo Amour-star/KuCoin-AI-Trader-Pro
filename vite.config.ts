@@ -8,7 +8,7 @@ export default defineConfig(({ mode }) => {
     envPrefix: ['VITE_', 'KUCOIN_', 'NEXT_PUBLIC_'],
     plugins: [react()],
     define: {
-      'process.env.NEXT_PUBLIC_API_URL': JSON.stringify(env.NEXT_PUBLIC_API_URL),
+      'process.env.NEXT_PUBLIC_API_URL': JSON.stringify(env.NEXT_PUBLIC_API_URL || ''),
     },
     server: {
       port: 3000,
