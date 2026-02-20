@@ -1,3 +1,37 @@
+export const API_BASE =
+  process.env.NEXT_PUBLIC_API_URL ||
+  'https://ai-trader-backend-production.up.railway.app';
+
+if (typeof window !== 'undefined') {
+  console.log('API BASE:', process.env.NEXT_PUBLIC_API_URL);
+}
+
+function normalizePath(path: string): string {
+  if (!path) return '/';
+  return path.startsWith('/') ? path : `/${path}`;
+}
+
+function buildUrl(path: string): string {
+  return `${API_BASE.replace(/\/+$/, '')}${normalizePath(path)}`;
+}
+
+export async function apiFetch(path: string, options?: RequestInit) {
+  const res = await fetch(buildUrl(path), {
+    ...options,
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options?.headers || {}),
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`API error: ${res.status}`);
+  }
+
+  return res.json();
+}
+
 export type EngineStatus = {
   running: boolean;
   lastHeartbeat: string | null;
@@ -49,48 +83,8 @@ export type SettingsPayload = {
   autoPaper?: boolean;
 };
 
-const globalEnv = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
-
-function getApiBase(): string {
-  const API_BASE = globalEnv?.NEXT_PUBLIC_API_URL;
-
-  if (!API_BASE) {
-    throw new Error('Missing NEXT_PUBLIC_API_URL. Add it in Vercel project environment variables.');
-  }
-
-  if (!API_BASE.startsWith('https://')) {
-    throw new Error('NEXT_PUBLIC_API_URL must use HTTPS.');
-  }
-
-  return API_BASE;
-}
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const apiBase = getApiBase();
-  let response: Response;
-
-  try {
-    response = await fetch(`${apiBase}${path}`, {
-      ...init,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(init?.headers ?? {}),
-      },
-    });
-  } catch {
-    throw new Error('Backend disconnected');
-  }
-
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || `Request failed: ${response.status}`);
-  }
-
-  return response.json() as Promise<T>;
-}
-
 export async function fetchStatus(): Promise<EngineStatus> {
-  const status = await request<any>('/api/status');
+  const status = await apiFetch('/api/status');
   return {
     running: Boolean(status.running),
     lastHeartbeat: status.lastHeartbeat ?? status.lastHeartbeatTs ?? null,
@@ -104,8 +98,7 @@ export async function fetchStatus(): Promise<EngineStatus> {
 }
 
 export async function fetchTrades(limit = 100): Promise<TradeRow[]> {
-  const rows = await request<any[]>('/api/trades?limit=' + limit);
-
+  const rows = await apiFetch(`/api/trades?limit=${limit}`) as any[];
   return rows.map((row) => ({
     id: String(row.id),
     symbol: String(row.symbol),
@@ -126,8 +119,7 @@ export async function fetchTrades(limit = 100): Promise<TradeRow[]> {
 }
 
 export async function fetchDecisions(limit = 100): Promise<DecisionRow[]> {
-  const rows = await request<any[]>('/api/decisions?limit=' + limit);
-
+  const rows = await apiFetch(`/api/decisions?limit=${limit}`) as any[];
   return rows.map((row) => ({
     ts: String(row.ts),
     symbol: String(row.symbol),
@@ -139,14 +131,14 @@ export async function fetchDecisions(limit = 100): Promise<DecisionRow[]> {
 }
 
 export async function forceTrade(payload: ForceTradePayload): Promise<{ tradeId: string; decisionId: string }> {
-  return request('/api/force-trade', {
+  return apiFetch('/api/force-trade', {
     method: 'POST',
     body: JSON.stringify(payload),
   });
 }
 
 export async function updateSettings(payload: SettingsPayload): Promise<{ autoPaper: boolean; confidenceThreshold: number }> {
-  return request('/api/settings', {
+  return apiFetch('/api/settings', {
     method: 'POST',
     body: JSON.stringify(payload),
   });
