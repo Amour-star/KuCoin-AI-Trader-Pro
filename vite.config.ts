@@ -13,6 +13,12 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 3000,
       proxy: {
+        '/api': {
+          target: env.NEXT_PUBLIC_API_URL || 'http://localhost:8787',
+          changeOrigin: true,
+          secure: true,
+          rewrite: path => `/api${path.replace(/^\/api/, '')}`,
+        },
         '/kucoin-api': {
           target: 'https://api.kucoin.com',
           changeOrigin: true,

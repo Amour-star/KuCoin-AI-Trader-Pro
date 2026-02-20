@@ -1,4 +1,5 @@
 export const API_URL = process.env.NEXT_PUBLIC_API_URL;
+export const API_PROXY_BASE = '/api';
 
 if (!API_URL) {
   console.warn(
@@ -8,4 +9,5 @@ if (!API_URL) {
 
 if (process.env.NODE_ENV !== 'production') {
   console.log('API_URL:', API_URL);
+  console.log('API_PROXY_BASE:', API_PROXY_BASE);
 }
