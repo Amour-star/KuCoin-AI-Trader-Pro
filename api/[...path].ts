@@ -14,14 +14,9 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 export default async function handler(req: IncomingMessage & { query?: { path?: string[] } }, res: ServerResponse) {
-  const backendBase = process.env.NEXT_PUBLIC_API_URL;
-
-  if (!backendBase) {
-    res.statusCode = 500;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ error: 'NEXT_PUBLIC_API_URL is not configured' }));
-    return;
-  }
+  const backendBase =
+    process.env.NEXT_PUBLIC_API_URL ||
+    'https://ai-trader-backend-production.up.railway.app';
 
   try {
     const pathSegments = Array.isArray(req.query?.path) ? req.query?.path : [];
