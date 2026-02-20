@@ -1,27 +1,23 @@
-import { API_PROXY_BASE, API_URL } from './config';
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_URL ||
+  'https://ai-trader-backend-production.up.railway.app';
 
-if (!API_URL) {
-  console.error('API_URL missing at build time');
+if (typeof window !== 'undefined') {
+  console.log('API URL:', process.env.NEXT_PUBLIC_API_URL);
 }
 
-const normalizedProxyBase = API_PROXY_BASE.replace(/\/+$/, '');
-
-function normalizePath(path: string): string {
-  if (!path) return '/';
-  return path.startsWith('/') ? path : `/${path}`;
-}
-
-export async function fetchApi(path: string, options?: RequestInit) {
-  const res = await fetch(`${normalizedProxyBase}${normalizePath(path)}`, {
+export async function apiFetch(path: string, options?: RequestInit) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
-      ...(options?.headers ?? {}),
+      ...(options?.headers || {}),
     },
-    ...options,
   });
 
   if (!res.ok) {
-    throw new Error(`API error: ${res.status}`);
+    throw new Error(`API error ${res.status}`);
   }
 
   return res.json();
@@ -79,7 +75,7 @@ export type SettingsPayload = {
 };
 
 export async function fetchStatus(): Promise<EngineStatus> {
-  const status = await fetchApi('/status');
+  const status = await apiFetch('/api/status');
   return {
     running: Boolean(status.running),
     lastHeartbeat: status.lastHeartbeat ?? status.lastHeartbeatTs ?? null,
@@ -93,7 +89,7 @@ export async function fetchStatus(): Promise<EngineStatus> {
 }
 
 export async function fetchTrades(limit = 100): Promise<TradeRow[]> {
-  const rows = await fetchApi(`/trades?limit=${limit}`) as any[];
+  const rows = (await apiFetch(`/api/trades?limit=${limit}`)) as any[];
   return rows.map((row) => ({
     id: String(row.id),
     symbol: String(row.symbol),
@@ -114,7 +110,7 @@ export async function fetchTrades(limit = 100): Promise<TradeRow[]> {
 }
 
 export async function fetchDecisions(limit = 100): Promise<DecisionRow[]> {
-  const rows = await fetchApi(`/decisions?limit=${limit}`) as any[];
+  const rows = (await apiFetch(`/api/decisions?limit=${limit}`)) as any[];
   return rows.map((row) => ({
     ts: String(row.ts),
     symbol: String(row.symbol),
@@ -126,14 +122,14 @@ export async function fetchDecisions(limit = 100): Promise<DecisionRow[]> {
 }
 
 export async function forceTrade(payload: ForceTradePayload): Promise<{ tradeId: string; decisionId: string }> {
-  return fetchApi('/force-trade', {
+  return apiFetch('/api/force-trade', {
     method: 'POST',
     body: JSON.stringify(payload),
   });
 }
 
 export async function updateSettings(payload: SettingsPayload): Promise<{ autoPaper: boolean; confidenceThreshold: number }> {
-  return fetchApi('/settings', {
+  return apiFetch('/api/settings', {
     method: 'POST',
     body: JSON.stringify(payload),
   });
